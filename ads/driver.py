@@ -128,10 +128,11 @@ def _run_plan(layout: RunLayout, cfg: Config, adapter: Adapter, state: State) ->
     spec_frozen = state.replan_scope == "design"
     intent_text = layout.intent.read_text(encoding="utf-8")
     task_body = cfg.phases["plan"].body.replace("{intent}", intent_text)
-    expert_body = cfg.experts["plan"].body
-    prompt = compose(cfg.base, expert_body, design="", task_body=task_body)
+    plan_expert = cfg.experts["plan"]
+    prompt = compose(cfg.base, plan_expert.body, design="", task_body=task_body)
 
-    result = adapter.run(prompt, cwd=layout.repo, tier="standard")
+    allowed_tools = list(plan_expert.tools) if plan_expert.tools else None
+    result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
     if result.exit_status != "ok" or not result.structured:
         return _halt(layout, state, f"plan run failed: {result.text[:200]}")
 
@@ -215,10 +216,12 @@ def _run_dispatch(layout: RunLayout, cfg: Config, adapter: Adapter, state: State
     design_text = layout.design.read_text(encoding="utf-8")
     critical_blocked = False
     for task in batch:
-        expert_body = cfg.experts[task.expert].body if task.expert in cfg.experts else ""
+        expert = cfg.experts.get(task.expert)
+        expert_body = expert.body if expert else ""
         task_body = cfg.phases["dispatch"].body.replace("{task}", task.body)
         prompt = compose(cfg.base, expert_body, design_text, task_body)
-        result = adapter.run(prompt, cwd=layout.repo, tier=task.tier)
+        allowed_tools = list(expert.tools) if expert and expert.tools else None
+        result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier=task.tier)
 
         if (
             result.exit_status == "ok"
@@ -291,9 +294,10 @@ def _check_criterion(
         return proc.returncode == 0
     if criterion.check == "judgment":
         task_body = cfg.phases["validate"].body.replace("{criterion}", criterion.value)
-        expert_body = cfg.experts.get("critic")
-        prompt = compose(cfg.base, expert_body.body if expert_body else "", "", task_body)
-        result = adapter.run(prompt, cwd=layout.repo, tier="standard")
+        critic = cfg.experts.get("critic")
+        prompt = compose(cfg.base, critic.body if critic else "", "", task_body)
+        allowed_tools = list(critic.tools) if critic and critic.tools else None
+        result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
         return bool(result.structured and result.structured.get("pass") is True)
     return False
 

@@ -1,7 +1,9 @@
 PHASE:validate-judgment
 
 Judge whether the following exit criterion is satisfied. Respond with exactly
-one JSON object, no prose outside it:
+one JSON object as your entire response: no prose before or after it, and no
+markdown code fences — just the raw JSON object (the ```json fence below is
+only to illustrate the shape), shaped as:
 
 ```json
 {"pass": true | false, "notes": "<why>"}

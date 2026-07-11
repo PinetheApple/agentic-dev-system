@@ -27,6 +27,7 @@ class PromptDoc:
 
     meta: dict[str, str]
     body: str
+    tools: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -37,29 +38,43 @@ class Config:
     phases: dict[str, PromptDoc]
 
 
-def _split_simple_frontmatter(text: str) -> tuple[dict[str, str], str]:
+TOOLS_KEY = "tools"
+
+
+def _parse_tools_list(value: str) -> tuple[str, ...]:
+    """`tools: [Read, Write, Edit, Bash]` inline-list syntax."""
+    inner = value.strip().removeprefix("[").removesuffix("]")
+    return tuple(item.strip() for item in inner.split(",") if item.strip())
+
+
+def _split_simple_frontmatter(text: str) -> tuple[dict[str, str], str, tuple[str, ...] | None]:
     """Optional `--- key: value ... ---` header followed by prose body.
 
     Only scalar `key: value` lines are supported here — experts/phases don't
-    need the richer list/map shape that task frontmatter does.
+    need the richer list/map shape that task frontmatter does — except for
+    the single `tools: [A, B]` inline-list key an expert may declare.
     """
     lines = text.splitlines()
     if not lines or lines[0].strip() != FRONTMATTER_DELIM:
-        return {}, text
+        return {}, text, None
     meta: dict[str, str] = {}
+    tools: tuple[str, ...] | None = None
     for idx in range(1, len(lines)):
         if lines[idx].strip() == FRONTMATTER_DELIM:
             body = "\n".join(lines[idx + 1 :]).lstrip("\n")
-            return meta, body
+            return meta, body, tools
         key, _, value = lines[idx].partition(":")
-        if key.strip():
-            meta[key.strip()] = value.strip()
-    return {}, text
+        key = key.strip()
+        if key == TOOLS_KEY:
+            tools = _parse_tools_list(value)
+        elif key:
+            meta[key] = value.strip()
+    return {}, text, None
 
 
 def _load_prompt_doc(path: Path) -> PromptDoc:
-    meta, body = _split_simple_frontmatter(path.read_text(encoding="utf-8"))
-    return PromptDoc(meta=meta, body=body)
+    meta, body, tools = _split_simple_frontmatter(path.read_text(encoding="utf-8"))
+    return PromptDoc(meta=meta, body=body, tools=tools)
 
 
 def _load_harness(path: Path) -> HarnessConfig:
