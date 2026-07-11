@@ -1,0 +1,7 @@
+# transient per-run state (any consuming repo, incl. examples/)
+**/.agent/runs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

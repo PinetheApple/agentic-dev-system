@@ -1,0 +1,43 @@
+[project]
+name = "agentic-dev-system"
+version = "0.1.0"
+description = "Harness-agnostic agentic dev system driver (reference vertical slice)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff>=0.8", "pyright>=1.1.390"]
+
+[project.scripts]
+driver = "ads.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ads*"]
+
+[tool.pyright]
+include = ["ads", "tests"]
+extraPaths = ["."]
+typeCheckingMode = "strict"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ANN", "PTH"]
+ignore = [
+    "ANN401",  # `Any` is sometimes the honest type at a JSON/subprocess boundary
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN201", "S101"]
+# the hand-rolled frontmatter parser deliberately mirrors YAML's tolerant
+# scalar/flow-list handling; line length rules fight its literal fixtures.
+"ads/tasks.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ads"]
