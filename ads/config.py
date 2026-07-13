@@ -7,7 +7,7 @@ experts/*.md, phases/*.md) is plain prose, composed in-memory by ads/prompt.py.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,11 +19,32 @@ DEFAULT_MAX_PARALLEL = 4
 
 
 @dataclass(frozen=True)
+class SandboxConfig:
+    """Raw `[sandbox]` knobs from harness.toml (ticket 011). Every list/tuple
+    field defaults to `()`, meaning "use `ads/sandbox.py`'s built-in
+    defaults" — this dataclass is a pass-through of the config file's shape;
+    `ads/sandbox.py`'s `policy_from_harness` owns the actual default values,
+    `~` expansion, and existence filtering so those lists live in one place."""
+
+    enabled: bool = False
+    deny_egress: bool = True
+    mem_max: str | None = None
+    cpu_quota: str | None = None
+    tmpfs_size: str | None = None
+    tasks_max: int | None = None
+    wall_clock: int | None = None
+    ro_paths: tuple[str, ...] = ()
+    mask_paths: tuple[str, ...] = ()
+    env_allowlist: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     tier_model: dict[str, str]
     run_cmd: list[str]
     capabilities: list[str]
     max_parallel: int = DEFAULT_MAX_PARALLEL
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
 @dataclass(frozen=True)
@@ -89,11 +110,28 @@ def _load_harness(path: Path) -> HarnessConfig:
         raw: dict[str, Any] = tomllib.load(fh)
     run_section = cast(dict[str, Any], raw.get("run", {}))
     capabilities_section = cast(dict[str, Any], raw.get("capabilities", {}))
+    sandbox_section = cast(dict[str, Any], raw.get("sandbox", {}))
     return HarnessConfig(
         tier_model=dict(raw.get("tier_model", {})),
         run_cmd=list(run_section.get("cmd", [])),
         capabilities=list(capabilities_section.get("flags", [])),
         max_parallel=int(capabilities_section.get("max_parallel", DEFAULT_MAX_PARALLEL)),
+        sandbox=_load_sandbox(sandbox_section),
+    )
+
+
+def _load_sandbox(section: dict[str, Any]) -> SandboxConfig:
+    return SandboxConfig(
+        enabled=bool(section.get("enabled", False)),
+        deny_egress=bool(section.get("deny_egress", True)),
+        mem_max=section.get("mem_max"),
+        cpu_quota=section.get("cpu_quota"),
+        tmpfs_size=section.get("tmpfs_size"),
+        tasks_max=section.get("tasks_max"),
+        wall_clock=section.get("wall_clock"),
+        ro_paths=tuple(section.get("ro_paths", ())),
+        mask_paths=tuple(section.get("mask_paths", ())),
+        env_allowlist=tuple(section.get("env_allowlist", ())),
     )
 
 

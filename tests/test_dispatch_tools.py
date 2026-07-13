@@ -5,6 +5,7 @@ file-writing task self-reports blocked."""
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from ads.adapters.base import RunResult
 from ads.adapters.stub import StubAdapter
-from ads.config import Config, HarnessConfig, PromptDoc, load_config
+from ads.config import Config, HarnessConfig, PromptDoc, SandboxConfig, load_config
 from ads.driver import (
     _run_dispatch,  # pyright: ignore[reportPrivateUsage]
     approve,
@@ -57,6 +58,12 @@ class TestDispatchForwardsExpertTools(unittest.TestCase):
         shutil.copytree(DEMO_CONFIG, self.repo / ".agent" / "config")
         self.layout = RunLayout(repo=self.repo, run_id="run-test")
         self.cfg = load_config(self.layout.config)
+        # ticket 011: the demo config opts real runs into the sandbox, but
+        # this test exercises tool-forwarding via real `cmd` exit criteria
+        # (`true`) with no bwrap/systemd-run assumption — keep it jail-free.
+        self.cfg = dataclasses.replace(
+            self.cfg, harness=dataclasses.replace(self.cfg.harness, sandbox=SandboxConfig())
+        )
 
     def test_python_expert_declared_tools_reach_adapter_run(self) -> None:
         adapter = RecordingAdapter()

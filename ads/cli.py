@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import cast, get_args
 
+from ads import sandbox
 from ads._literal import validate_literal
 from ads.adapters.base import (
     ADAPTER_CLAUDE_CODE,
@@ -40,9 +41,10 @@ def _adapter_name_arg(raw: str | None) -> AdapterName | None:
 def _build_adapter(name: AdapterName, cfg: Config) -> Adapter:
     if name == ADAPTER_STUB:
         return StubAdapter()
+    policy = sandbox.policy_from_harness(cfg.harness)
     if name == ADAPTER_OPENCODE:
-        return OpenCodeAdapter(cfg.harness)
-    return ClaudeCodeAdapter(cfg.harness)
+        return OpenCodeAdapter(cfg.harness, policy=policy)
+    return ClaudeCodeAdapter(cfg.harness, policy=policy)
 
 
 def _adapter_for_run(layout: RunLayout, cfg: Config, override: AdapterName | None) -> Adapter:

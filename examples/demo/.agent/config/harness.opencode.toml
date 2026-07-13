@@ -13,3 +13,13 @@ cmd = ["opencode", "run"]
 
 [capabilities]
 flags = ["tools", "streaming", "json_output"]
+
+# ticket 011: identical containment policy across harnesses — this table is
+# byte-identical between harness.toml and harness.opencode.toml on purpose.
+[sandbox]
+enabled = true
+deny_egress = true
+mem_max = "2G"
+cpu_quota = "150%"
+tasks_max = 512
+wall_clock = 600

@@ -40,7 +40,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from ads import reconcile, resplit, validate, worktree
+from ads import reconcile, resplit, sandbox, validate, worktree
 from ads import resume as resume_module
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
@@ -210,7 +210,10 @@ def _gate_and_route(
     May raise `resplit.ResplitDepthExceeded` — the caller lets it propagate
     to the driver's existing halt-to-human handling.
     """
-    tv = validate.evaluate_task_at(layout, cfg, adapter, task, cwd=cwd, diff_text=diff_text)
+    policy = sandbox.policy_from_harness(cfg.harness)
+    tv = validate.evaluate_task_at(
+        layout, cfg, adapter, task, cwd=cwd, diff_text=diff_text, policy=policy
+    )
     if tv.passed:
         return True
 

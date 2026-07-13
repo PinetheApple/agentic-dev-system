@@ -31,21 +31,24 @@ criteria/verdicts and writes the audit trail (`validation-report.md`).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ads import resume as resume_module
-from ads import worktree
+from ads import sandbox, worktree
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
 from ads.layout import RunLayout
 from ads.prompt import compose
+from ads.sandbox import SandboxPolicy
 from ads.tasks import ExitCriterion, ExitCriterionCheck, Task
 
 CMD_TIMEOUT_SECONDS = 300
 CODE_REVIEW_CAPABILITY = "code-review"
 REPORT_FILENAME = "validation-report.md"
+_DISABLED_SANDBOX_POLICY = SandboxPolicy(enabled=False)
 
 CODE_REVIEW_INSTRUCTION = (
     "This harness advertises a `code-review` capability — drive that skill "
@@ -94,14 +97,18 @@ def evaluate_task_at(
     *,
     cwd: Path,
     diff_text: str,
+    policy: SandboxPolicy = _DISABLED_SANDBOX_POLICY,
 ) -> TaskValidation:
     """Evaluate `task`'s exit criteria at an explicit `cwd` (for `cmd`
     criteria) and `diff_text` (for `judgment` criteria) — both supplied by
     the caller rather than self-computed, so this works identically whether
     called pre-merge from a live worktree (`ads/dispatch.py`) or from the
-    in-place, non-git fallback."""
+    in-place, non-git fallback. `policy` jails the `cmd` gate (ticket 011);
+    it defaults to disabled so existing callers/tests are unaffected."""
     results = [
-        _evaluate_criterion(layout, cfg, adapter, task, criterion, cwd=cwd, diff_text=diff_text)
+        _evaluate_criterion(
+            layout, cfg, adapter, task, criterion, cwd=cwd, diff_text=diff_text, policy=policy
+        )
         for criterion in task.exit_criteria
     ]
     return TaskValidation(task=task, results=results)
@@ -116,26 +123,44 @@ def _evaluate_criterion(
     *,
     cwd: Path,
     diff_text: str,
+    policy: SandboxPolicy,
 ) -> CriterionResult:
     if criterion.check == "cmd":
-        return _run_cmd_criterion(cwd, criterion)
+        return _run_cmd_criterion(cwd, criterion, policy)
     return _run_judgment_criterion(layout, cfg, adapter, task, criterion, diff_text=diff_text)
 
 
-def _run_cmd_criterion(cwd: Path, criterion: ExitCriterion) -> CriterionResult:
+def _run_cmd_criterion(
+    cwd: Path, criterion: ExitCriterion, policy: SandboxPolicy
+) -> CriterionResult:
+    sandbox.require(policy)  # fail-closed
+    env = sandbox.resolve_env(policy, os.environ)
+    argv, use_shell = sandbox.wrap_shell(criterion.value, cwd, policy, env)
+
+    # dec 7 soft screen: advisory-only, lands in the report/feedback text so
+    # a human reviewer sees it — never blocks execution. Routing a flagged
+    # command to approval is the deferred dec-6 `needs-escalation` machinery.
+    verdict = sandbox.classify_cmd(criterion.value)
+    flag_note = ""
+    if verdict.flagged:
+        flag_note = f"\n[sandbox classifier] flagged: {', '.join(verdict.reasons)}"
+
     try:
         proc = subprocess.run(
-            criterion.value,
-            shell=True,
+            argv,
+            shell=use_shell,
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=CMD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        detail = f"timed out after {CMD_TIMEOUT_SECONDS}s: {criterion.value!r}"
+        detail = f"timed out after {CMD_TIMEOUT_SECONDS}s: {criterion.value!r}{flag_note}"
         return CriterionResult(check="cmd", value=criterion.value, passed=False, detail=detail)
-    detail = f"exit={proc.returncode}\n--- stdout ---\n{proc.stdout}--- stderr ---\n{proc.stderr}"
+    detail = (
+        f"exit={proc.returncode}\n--- stdout ---\n{proc.stdout}--- stderr ---\n{proc.stderr}"
+        f"{flag_note}"
+    )
     return CriterionResult(
         check="cmd", value=criterion.value, passed=proc.returncode == 0, detail=detail
     )

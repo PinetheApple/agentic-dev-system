@@ -1,13 +1,14 @@
 """Full intake -> plan -> review -> dispatch -> validate -> done loop against
 the stub adapter — no tokens spent, proves the spine end to end."""
 
+import dataclasses
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 from ads.adapters.stub import StubAdapter
-from ads.config import load_config
+from ads.config import SandboxConfig, load_config
 from ads.driver import approve, reject, run_until_halt, start_run
 from ads.layout import RunLayout
 from ads.state import load_state
@@ -24,6 +25,12 @@ class TestDriverStubLoop(unittest.TestCase):
         shutil.copytree(DEMO_CONFIG, self.repo / ".agent" / "config")
         self.layout = RunLayout(repo=self.repo, run_id="run-test")
         self.cfg = load_config(self.layout.config)
+        # ticket 011: the demo config opts real runs into the sandbox, but
+        # this is a stub-driven spine smoke test exercising real `cmd` exit
+        # criteria (`true`) with no bwrap/systemd-run assumption — jail-free.
+        self.cfg = dataclasses.replace(
+            self.cfg, harness=dataclasses.replace(self.cfg.harness, sandbox=SandboxConfig())
+        )
         self.adapter = StubAdapter()
 
     def test_full_loop_with_gates(self) -> None:

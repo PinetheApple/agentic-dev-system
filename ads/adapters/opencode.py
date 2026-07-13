@@ -24,13 +24,16 @@ falls back to `--auto` so the run can still act, and `capabilities()` omits
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import cast
 
+from ads import sandbox
 from ads.adapters._json_envelope import parse_phase_payload
 from ads.adapters.base import RunResult, StructuredPayload
 from ads.config import HarnessConfig
+from ads.sandbox import SANDBOX_NATIVE_CAPABILITY, SandboxPolicy
 from ads.tasks import TaskTier
 
 DEFAULT_TIMEOUT_SECONDS = 600
@@ -82,9 +85,15 @@ def parse_opencode_stdout(stdout: str) -> tuple[str, StructuredPayload | None]:
 
 
 class OpenCodeAdapter:
-    def __init__(self, harness: HarnessConfig, opencode_bin: str = "opencode") -> None:
+    def __init__(
+        self,
+        harness: HarnessConfig,
+        opencode_bin: str = "opencode",
+        policy: SandboxPolicy | None = None,
+    ) -> None:
         self._harness = harness
         self._opencode_bin = opencode_bin
+        self._policy = policy or SandboxPolicy(enabled=False)
 
     def resolve_model(self, tier: TaskTier) -> str:
         try:
@@ -118,13 +127,29 @@ class OpenCodeAdapter:
             # honest mapping (auto-approve, rather than scope, tool use).
             cmd.append("--auto")
 
+        timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+        if SANDBOX_NATIVE_CAPABILITY in self.capabilities():
+            # dec 9: the harness advertises its own native sandbox, so the
+            # driver does not double-wrap — specified-but-unvalidated, no
+            # ref harness does this today (see ads/sandbox.py docstring).
+            pass
+        else:
+            sandbox.require(self._policy)  # fail-closed
+            env = sandbox.resolve_env(self._policy, os.environ)
+            cmd = sandbox.wrap(cmd, cwd, self._policy, env)
+            if self._policy.enabled and self._policy.wall_clock_seconds:
+                # OS-backstop timeout (dec 8); a true scope-kill is
+                # systemd-run's job and the hard-kill -> `killed` outcome
+                # mapping stays fog for this slice (dec 6 escalation area).
+                timeout_seconds = self._policy.wall_clock_seconds
+
         try:
             proc = subprocess.run(
                 cmd,
                 cwd=cwd,
                 capture_output=True,
                 text=True,
-                timeout=DEFAULT_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
             return RunResult(text=str(exc), structured=None, exit_status="error")
