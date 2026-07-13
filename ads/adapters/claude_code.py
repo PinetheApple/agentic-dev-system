@@ -99,7 +99,12 @@ class ClaudeCodeAdapter:
             "json",
         ]
         if allowed_tools:
-            cmd += ["--allowedTools", ",".join(allowed_tools)]
+            # `--allowedTools` is space-variadic (claude 2.1.207): it takes
+            # each tool name as its own argv token, not a single
+            # comma-joined string — `--allowedTools Read,Edit,Write` parses
+            # as ONE (unknown) tool name and silently grants nothing. Must
+            # stay last in argv so the variadic doesn't swallow later flags.
+            cmd += ["--allowedTools", *allowed_tools]
 
         timeout_seconds = DEFAULT_TIMEOUT_SECONDS
         if SANDBOX_NATIVE_CAPABILITY in self.capabilities():

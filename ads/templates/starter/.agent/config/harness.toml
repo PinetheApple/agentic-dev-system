@@ -1,0 +1,30 @@
+# Only harness-aware file in the config tree (ticket 002). Target: claude-code.
+# `claude-sonnet-5` / `claude-opus-4-8` / `claude-haiku-4-5` are `claude` CLI
+# model aliases (resolved by `claude --model <alias>`), not hardcoded
+# provider snapshot ids — swap them for pinned ids if you need reproducible
+# model versions across runs.
+
+[tier_model]
+fast = "claude-haiku-4-5"
+standard = "claude-sonnet-5"
+deep = "claude-opus-4-8"
+
+[run]
+cmd = ["claude", "-p"]
+
+[capabilities]
+flags = ["tools", "allowedtools-cli", "streaming", "json_output"]
+
+# ticket 011: the driver-wrap sandbox (`ads/sandbox.py`) jails a run() call
+# with `bwrap --unshare-net` — an egress-deny network jail. That is FATAL
+# for Claude Code: `claude -p` itself needs network access to reach the
+# Anthropic API, so wrapping it in `--unshare-net` would sever the model
+# call before it ever reaches a tool. The sandbox is designed to contain an
+# *agent's tool subprocesses* (the file edits/shell commands the model
+# asks for), not the LLM-transport CLI that makes the API call in the first
+# place — those are two different trust boundaries that this slice doesn't
+# yet separate (see ticket 011 fog). Leave `enabled = false` here unless
+# you're running a local/offline model, or a harness that natively sandboxes
+# only its own tool-use (see `ads/sandbox.py`'s `SANDBOX_NATIVE_CAPABILITY`).
+[sandbox]
+enabled = false

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.resources
+import shutil
 import sys
 import time
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import cast, get_args
 
@@ -79,6 +82,56 @@ def _resolve_run_id(layout_root: RunLayout, explicit: str | None) -> str:
 
 def _print_status(layout: RunLayout) -> None:
     print(status.render_plain(status.read_status(layout)), end="")
+
+
+def _copy_template_tree(src: Traversable, dst: Path) -> None:
+    """Recursively copy a package-resource tree onto the filesystem — plain
+    `shutil.copytree` can't take an `importlib.resources.files()` handle
+    directly (it may be a real dir on a checkout or a zip-backed Traversable
+    on an installed wheel), so this walks it by hand."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in src.iterdir():
+        target = dst / entry.name
+        if entry.is_dir():
+            _copy_template_tree(entry, target)
+        else:
+            target.write_bytes(entry.read_bytes())
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    config_dir = repo / ".agent" / "config"
+    adapter_name = _adapter_name_arg(args.adapter) or ADAPTER_CLAUDE_CODE
+
+    if config_dir.exists() and any(config_dir.iterdir()) and not args.force:
+        raise SystemExit(
+            f"{config_dir} already exists and is non-empty — pass --force to overwrite"
+        )
+    if config_dir.exists() and args.force:
+        shutil.rmtree(config_dir)
+
+    template_root = importlib.resources.files("ads") / "templates" / "starter" / ".agent" / "config"
+    _copy_template_tree(template_root, config_dir)
+
+    if adapter_name == ADAPTER_OPENCODE:
+        # Lower-churn than maintaining a second mirrored template tree: the
+        # starter is claude-code-shaped (harness.toml is the only
+        # harness-aware file, see ads/config.py); point the user at
+        # examples/demo/.agent/config/harness.opencode-free.toml as the
+        # reference shape to hand-edit into their scaffolded harness.toml.
+        print(
+            "note: --adapter opencode scaffolded the claude-code starter config — "
+            "edit .agent/config/harness.toml's [tier_model]/[run]/[capabilities] "
+            "to target opencode (see examples/demo/.agent/config/harness.opencode-free.toml "
+            "for the reference shape); [sandbox] can stay disabled either way."
+        )
+
+    print(f"scaffolded {config_dir}")
+    print("next steps:")
+    print('  driver start "<your task>"')
+    print("  driver approve   # spec stage -> design stage")
+    print("  driver approve   # design stage -> dispatch, then auto-runs")
+    print("  driver watch     # live TUI (or: driver status --json)")
 
 
 def cmd_start(args: argparse.Namespace) -> None:
@@ -281,6 +334,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="harness adapter; set at start, persisted per-run",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="scaffold .agent/config/ into --repo")
+    p_init.add_argument(
+        "--force", action="store_true", help="overwrite an existing non-empty .agent/config/"
+    )
+    p_init.set_defaults(func=cmd_init)
 
     p_start = sub.add_parser("start", help="start a new run")
     p_start.add_argument("task", help="the user's task/intent text")

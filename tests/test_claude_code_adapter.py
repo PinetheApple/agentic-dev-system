@@ -5,9 +5,14 @@ CLI's own JSON envelope's `result` field, not at the envelope's top level."""
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
+from pathlib import Path
+from typing import Any
 
-from ads.adapters.claude_code import parse_claude_stdout
+from ads.adapters.claude_code import ClaudeCodeAdapter, parse_claude_stdout
+from ads.config import HarnessConfig
+from ads.sandbox import SandboxPolicy
 
 
 class TestParseClaudeStdout(unittest.TestCase):
@@ -91,6 +96,43 @@ class TestParseClaudeStdout(unittest.TestCase):
 
         self.assertIsNone(structured)
         self.assertEqual(text, stdout)
+
+
+class TestRunAllowedToolsArgv(unittest.TestCase):
+    """`--allowedTools` is space-variadic in the real `claude` CLI: each tool
+    must be its own argv token, not a comma-joined string, or claude parses
+    it as one unknown tool name and grants nothing."""
+
+    def test_allowed_tools_are_separate_trailing_argv_tokens(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(
+                cmd, returncode=0, stdout=json.dumps({"type": "result", "result": "{}"}), stderr=""
+            )
+
+        harness = HarnessConfig(
+            tier_model={"standard": "claude-sonnet-5"},
+            run_cmd=["claude", "-p"],
+            capabilities=["tools", "allowedtools-cli"],
+        )
+        adapter = ClaudeCodeAdapter(harness, policy=SandboxPolicy(enabled=False))
+
+        real_run = subprocess.run
+        subprocess.run = fake_run  # type: ignore[assignment]
+        try:
+            adapter.run(
+                "do the thing",
+                cwd=Path(),
+                allowed_tools=["Read", "Edit", "Write"],
+                tier="standard",
+            )
+        finally:
+            subprocess.run = real_run  # type: ignore[assignment]
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[-4:], ["--allowedTools", "Read", "Edit", "Write"])
 
 
 if __name__ == "__main__":

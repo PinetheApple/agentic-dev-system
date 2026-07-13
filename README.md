@@ -4,6 +4,24 @@ Harness-agnostic driver for an external "structured Ralph" control loop: the
 driver owns phase sequencing and state, a swappable adapter owns in-phase
 reasoning (Claude Code today; any harness that implements `run()` tomorrow).
 
+## Quickstart
+
+```bash
+uv pip install -e .            # or: uv tool install .
+cd /path/to/your/project       # a git repo
+driver init                    # scaffolds .agent/config/ (edit harness.toml/experts to taste)
+driver start "Add X to the project"
+driver approve                 # approve spec, then run again to approve design
+driver approve
+driver watch                   # live TUI (or: driver status [--json])
+```
+
+Dispatch runs `claude -p` per task in isolated git worktrees, so you need the
+`claude` CLI installed and authenticated. The starter config keeps the
+ticket-011 sandbox OFF: enabling it would sever `claude`'s own API call (the
+jail is `--unshare-net`, egress-deny) — see the comment in the scaffolded
+`harness.toml` for the full reasoning.
+
 ## Layout
 
 - `ads/layout.py` — on-disk paths for a run under `.agent/runs/<run-id>/`.
@@ -21,7 +39,9 @@ reasoning (Claude Code today; any harness that implements `run()` tomorrow).
   (canned responses for token-free testing), `_json_envelope.py` (shared
   fence-stripping/phase-JSON parsing both real adapters reuse).
 - `ads/driver.py` — the phase state machine.
-- `ads/cli.py` — `driver start|resume|approve|reject|status`.
+- `ads/cli.py` — `driver init|start|resume|approve|reject|status|watch|
+  escalations|escalate-approve|escalate-reject|pause|redirect|edit|replan|
+  abort`. See the verb-by-verb list under [Usage](#usage) below.
 
 ## Phase graph
 
@@ -104,6 +124,31 @@ driver --repo examples/demo resume
 `--adapter stub` swaps in canned responses (see `ads/adapters/stub.py`) for
 running the loop without spending tokens — this is what `tests/test_driver_stub.py`
 uses.
+
+### CLI verbs
+
+- `init [--repo .] [--force] [--adapter claude-code]` — scaffold `.agent/config/` into a repo.
+- `start "<task>"` — begin a new run from an intent string.
+- `resume` — clear an operator pause and drive the loop to the next halt.
+- `approve` / `reject "<reason>"` — advance or bounce the current review gate.
+- `status [--json]` — snapshot the current run.
+- `watch [--poll N]` — live TUI over run status.
+- `escalations` — list open escalation requests.
+- `escalate-approve <id>` / `escalate-reject <id> "<reason>"` — resolve one.
+- `pause` — queue an operator pause, drained at the next unit boundary.
+- `redirect <task> "<note>"` — inject an operator note into a task's scratch file.
+- `edit <task>` — queue a pause so a pending task's file can be hand-edited.
+- `replan` — queue a full replan loopback to the `plan` phase.
+- `abort <task>` — queue an abort for a task (graph bookkeeping only).
+
+### Sandbox / containment
+
+Per-repo containment (ticket 011) is configured in `harness.toml`'s
+`[sandbox]` table. It is **off by default** in the `driver init` starter
+config, because the jail (`bwrap --unshare-net`) would sever `claude -p`'s
+own API call, not just its tool subprocesses — see the comment block in the
+scaffolded `harness.toml` for the full reasoning, and `ads/sandbox.py`'s
+module docstring for the mechanism.
 
 ## Examples
 

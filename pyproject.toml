@@ -18,6 +18,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["ads*"]
 
+[tool.setuptools.package-data]
+ads = ["templates/starter/.agent/config/*.toml", "templates/starter/.agent/config/**/*.md"]
+
 [tool.pyright]
 include = ["ads", "tests"]
 extraPaths = ["."]
