@@ -20,6 +20,13 @@ its own transcript "summarized in place" mid-flight. Whatever compaction a
 harness performs natively inside one `run()` call is a non-load-bearing
 accelerator ADS never depends on or drives; nothing here builds or calls
 into such a mechanism.
+
+TODO(ticket-007 follow-up): a task's merge here happens before its `cmd`/
+`judgment` exit criteria are checked (`ads/validate.py` runs in the separate,
+later `validate` phase) — i.e. gates currently run post-merge, not
+pre-merge. Ticket 007's "a task never merges dirty" sequencing would move
+the per-task gate check into this module, before `merge_task_branch`. Not
+built in this increment; kept as a separate, deliberately post-merge phase.
 """
 
 from __future__ import annotations

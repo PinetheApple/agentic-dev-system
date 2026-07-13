@@ -126,11 +126,12 @@ def full_diff(wt: TaskWorktree) -> str:
     return _require_git(["diff", wt.base_sha, "HEAD"], wt.path, f"diff ({wt.task_id})").stdout
 
 
-def _covers(changed_path: str, owns_entry: str) -> bool:
+def covers(changed_path: str, owns_entry: str) -> bool:
     """One `owns` entry covers a changed path if the path equals it, sits
     under it as a directory prefix, or matches it as an fnmatch glob. This
     is the owns-coverage rule for the write-set audit: `owns` entries are
-    treated as path prefixes/globs, not only exact file paths."""
+    treated as path prefixes/globs, not only exact file paths. Also reused
+    by validate's integration-critic path attribution (ticket 007)."""
     normalized = owns_entry.rstrip("/")
     if changed_path == normalized or changed_path.startswith(normalized + "/"):
         return True
@@ -138,7 +139,22 @@ def _covers(changed_path: str, owns_entry: str) -> bool:
 
 
 def uncovered_files(paths: list[str], owns: list[str]) -> list[str]:
-    return [p for p in paths if not any(_covers(p, entry) for entry in owns)]
+    return [p for p in paths if not any(covers(p, entry) for entry in owns)]
+
+
+def find_worktree_dir(run_id: str, task_id: str) -> Path | None:
+    """Locate a task's still-on-disk worktree, if any (ticket 007 cmd gate:
+    grounded checks run there when present, so they see exactly what the
+    task produced). Clean tasks have no worktree left by the time validate
+    runs — `remove_worktree` deletes it on merge — so this is only non-None
+    for the rare case a worktree was intentionally left behind (e.g. a
+    reconcile tripwire, or the in-place/non-git dispatch path never made
+    one at all)."""
+    base_dir = Path(tempfile.gettempdir()) / "ads-worktrees" / run_id
+    if not base_dir.exists():
+        return None
+    matches = sorted(base_dir.glob(f"{task_id}-*"))
+    return matches[0] if matches else None
 
 
 def merge_task_branch(repo: Path, wt: TaskWorktree, owns: list[str]) -> MergeOutcome:

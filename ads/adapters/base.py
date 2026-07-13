@@ -62,7 +62,7 @@ StructuredPayload = TypedDict(
         "design": str,
         "tasks": list[TaskPayload],
         "pass": bool,
-        "notes": str,
+        "evidence": str,
         "cited_paths": list[str],
     },
     total=False,

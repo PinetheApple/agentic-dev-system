@@ -6,9 +6,7 @@ what to do next; events.jsonl is write-only audit.
 
 from __future__ import annotations
 
-import subprocess
-
-from ads import dispatch
+from ads import dispatch, validate
 from ads.adapters.base import Adapter, TaskPayload
 from ads.config import Config
 from ads.layout import RunLayout
@@ -21,6 +19,7 @@ from ads.tasks import CycleError, ExitCriterion, Task, check_acyclic
 MAX_RETRIES = 2
 REVIEW_TO_PLAN = "review_to_plan"
 VALIDATE_TO_DISPATCH = "validate_to_dispatch"
+VALIDATE_INTEGRATION = "validate_integration"
 
 
 class DriverError(RuntimeError):
@@ -199,57 +198,87 @@ def _run_dispatch(layout: RunLayout, cfg: Config, adapter: Adapter, state: State
 
 
 # ---------------------------------------------------------------------------
-# validate
+# validate (ticket 007: cmd gate + judgment critic + integration critic —
+# see ads/validate.py for the gate mechanics; this is only the retry-bounded
+# state machine around them, mirroring the review gate's evaluator-optimizer
+# shape below)
 # ---------------------------------------------------------------------------
 
 
 def _run_validate(layout: RunLayout, cfg: Config, adapter: Adapter, state: State) -> State:
     all_tasks = load_tasks(layout)
-    failed_task_ids: list[str] = []
+    task_validations = [validate.evaluate_task(layout, cfg, adapter, t) for t in all_tasks]
+    failed_task_ids = [tv.task.id for tv in task_validations if not tv.passed]
 
-    for task in all_tasks:
-        for criterion in task.exit_criteria:
-            if not _check_criterion(layout, cfg, adapter, criterion):
-                failed_task_ids.append(task.id)
-                break
+    if failed_task_ids:
+        validate.write_report(layout, task_validations, integration=None)
+        for tv in task_validations:
+            if not tv.passed:
+                validate.write_task_feedback(layout, tv)
+        return _retry_validate(
+            layout,
+            state,
+            all_tasks,
+            failed_task_ids,
+            VALIDATE_TO_DISPATCH,
+            f"{VALIDATE_TO_DISPATCH} retries exhausted: {failed_task_ids}",
+        )
 
-    if not failed_task_ids:
-        state.phase = "done"
-        state.gate = None
-        save_state(layout, state)
-        append_event(layout, "validate_pass")
-        return state
+    integration = validate.run_integration_critic(layout, cfg, adapter)
+    validate.write_report(layout, task_validations, integration=integration)
 
-    count = state.retry_counts.get(VALIDATE_TO_DISPATCH, 0) + 1
+    if not integration.passed:
+        attributed = validate.attribute_paths(all_tasks, integration.cited_paths)
+        if not attributed:
+            # TODO(ticket-005-rule-5): an integration failure with no task
+            # owning the cited gap (or no citations at all) is "missing
+            # work" — it needs 003's resumptive re-split, which doesn't
+            # exist yet. Halt to a human instead of guessing which task to
+            # retry.
+            return _halt(
+                layout,
+                state,
+                "integration critic failed with no attributable task "
+                f"(needs resumptive re-split, TODO ticket-005-rule-5): {integration.evidence}",
+            )
+        for task_id in attributed:
+            validate.write_integration_feedback(layout, task_id, integration)
+        return _retry_validate(
+            layout,
+            state,
+            all_tasks,
+            attributed,
+            VALIDATE_INTEGRATION,
+            f"{VALIDATE_INTEGRATION} retries exhausted: {attributed}",
+        )
+
+    state.phase = "done"
+    state.gate = None
+    save_state(layout, state)
+    append_event(layout, "validate_pass")
+    return state
+
+
+def _retry_validate(
+    layout: RunLayout,
+    state: State,
+    all_tasks: list[Task],
+    task_ids: list[str],
+    retry_key: str,
+    exhausted_reason: str,
+) -> State:
+    count = state.retry_counts.get(retry_key, 0) + 1
     if count > MAX_RETRIES:
-        return _halt(layout, state, f"{VALIDATE_TO_DISPATCH} retries exhausted: {failed_task_ids}")
+        return _halt(layout, state, exhausted_reason)
 
-    state.retry_counts[VALIDATE_TO_DISPATCH] = count
+    state.retry_counts[retry_key] = count
     for task in all_tasks:
-        if task.id in failed_task_ids:
+        if task.id in task_ids:
             task.status = "pending"
             write_task(layout, task)
             state.tasks[task.id] = "pending"
     state.phase = "dispatch"
     state.gate = None
     save_state(layout, state)
-    append_event(layout, "validate_fail", task_ids=failed_task_ids, retries=count)
+    append_event(layout, "validate_fail", task_ids=task_ids, retries=count, retry_key=retry_key)
     return state
-
-
-def _check_criterion(
-    layout: RunLayout, cfg: Config, adapter: Adapter, criterion: ExitCriterion
-) -> bool:
-    if criterion.check == "cmd":
-        proc = subprocess.run(
-            criterion.value, shell=True, cwd=layout.repo, capture_output=True, text=True
-        )
-        return proc.returncode == 0
-    if criterion.check == "judgment":
-        task_body = cfg.phases["validate"].body.replace("{criterion}", criterion.value)
-        critic = cfg.experts.get("critic")
-        prompt = compose(cfg.base, critic.body if critic else "", "", task_body)
-        allowed_tools = list(critic.tools) if critic and critic.tools else None
-        result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
-        return bool(result.structured and result.structured.get("pass") is True)
-    return False

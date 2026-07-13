@@ -28,10 +28,15 @@ DEMO_CONFIG = REPO_ROOT / "examples" / "demo" / ".agent" / "config"
 
 
 class RecordingAdapter(StubAdapter):
-    """Delegates to StubAdapter but records every `allowed_tools` it was called with."""
+    """Delegates to StubAdapter but records every `(prompt, allowed_tools)` it
+    was called with, so callers can isolate dispatch-phase calls from the
+    validate phase's judgment/integration critic calls (ticket 007), which
+    carry the critic's own `tools` and are not part of what this test
+    covers."""
 
     def __init__(self) -> None:
-        self.calls: list[list[str] | None] = []
+        super().__init__()
+        self.calls: list[tuple[str, list[str] | None]] = []
 
     def run(
         self,
@@ -40,7 +45,7 @@ class RecordingAdapter(StubAdapter):
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
     ) -> RunResult:
-        self.calls.append(allowed_tools)
+        self.calls.append((prompt, allowed_tools))
         return super().run(prompt, cwd, allowed_tools=allowed_tools, tier=tier)
 
 
@@ -64,7 +69,7 @@ class TestDispatchForwardsExpertTools(unittest.TestCase):
         adapter.calls.clear()
         run_until_halt(self.layout, self.cfg, adapter)  # dispatch -> validate -> done
 
-        dispatch_calls = [c for c in adapter.calls if c is not None]
+        dispatch_calls = [tools for prompt, tools in adapter.calls if "PHASE:dispatch" in prompt]
         self.assertTrue(dispatch_calls, "expected at least one dispatch call with tools recorded")
         for call in dispatch_calls:
             self.assertEqual(call, ["Read", "Write", "Edit", "Bash"])
@@ -99,7 +104,7 @@ class TestDispatchForwardsExpertTools(unittest.TestCase):
 
         _run_dispatch(self.layout, cfg_no_tools, adapter, state)
 
-        self.assertEqual(adapter.calls, [None])
+        self.assertEqual([tools for _, tools in adapter.calls], [None])
 
 
 if __name__ == "__main__":

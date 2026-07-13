@@ -45,11 +45,47 @@ intake -> plan -> review(spec) -> review(design) -> dispatch -> validate -> done
   `owns`) and calls `run()` once per task with `base + expert + design.md +
   task body`. Re-run picks up only tasks still `pending` — this is what makes
   resume-after-crash safe.
-- `validate`: runs each task's `exit_criteria` — `cmd` via subprocess, `judgment`
-  via a critic `run()` call. Failures reset those tasks to `pending` and loop
-  back to `dispatch`, bounded by `MAX_RETRIES=2`.
-- Retry exhaustion on either backward edge sets `gate: blocked` with a
+- `validate` (`ads/validate.py`): three gates, all author-agnostic and
+  forgery-proof — no agent self-report counts as done.
+  1. **`cmd`** — a driver-executed subprocess (in the task's worktree if one
+     is still on disk, else the target repo); the real exit code is the
+     verdict.
+  2. **`judgment`** — a fresh, cold critic `run()` given `spec.md` + the
+     task's on-disk `owns` diff only (never the author's scratch/self-summary),
+     returning a structured `{pass, evidence, cited_paths}` verdict. A
+     `pass: true` with empty `cited_paths` is auto-failed by the driver — the
+     anti-rubber-stamp check is structural, not honor-system. If the adapter's
+     `harness.toml` advertises a `code-review` capability, the critic prompt
+     drives that skill first; the inline structured-verdict contract is the
+     mandatory floor either way.
+  3. **integration critic** — one more critic `run()`, once per run after
+     every leaf's gates pass and before `done`, over the whole `spec.md` +
+     the full merged run diff. Catches cross-task seam gaps no single leaf's
+     own gate would see.
+
+  A leaf is done only when all its `cmd` criteria exit 0 and all its
+  `judgment` criteria pass with non-empty citations. Failures write feedback
+  into that task's `scratch/<id>.md` (ticket 005's resume read-set) and reset
+  it to `pending`, looping back to `dispatch`; task-level and integration-level
+  failures are each bounded by their own `MAX_RETRIES=2` counter
+  (`validate_to_dispatch`, `validate_integration`). An integration failure
+  whose cited paths attribute to specific tasks' `owns` retries just those
+  leaves the same way; one with no attributable task ("missing work" — no
+  task owns the gap) needs 003's resumptive re-split, which doesn't exist yet
+  (`TODO(ticket-005-rule-5)` in `ads/driver.py`) — it halts to a human
+  immediately instead of guessing. Every validate pass writes
+  `validation-report.md` to the run dir (every `cmd`/`judgment` result,
+  integration verdict) as a full audit trail, whether or not it blocks.
+- Retry exhaustion on any backward edge (`review_to_plan`,
+  `validate_to_dispatch`, `validate_integration`) sets `gate: blocked` with a
   `halt_reason` — a human must intervene (edit artifacts, then `driver resume`).
+  Humans are otherwise exception-only: a clean run reaches `done` autonomously.
+- **Deferred (ticket 007 follow-up):** gates currently run post-merge, in this
+  separate `validate` phase — ticket 007's before-merge sequencing (a task
+  never merges dirty) would require restructuring `dispatch`'s per-task merge
+  step to gate on that task's own `cmd`/`judgment` criteria first; not done in
+  this increment (see `ads/dispatch.py`'s module docstring). PR creation
+  (ticket 007 §8) is likewise out of scope — no PR step exists yet.
 
 ## Usage
 

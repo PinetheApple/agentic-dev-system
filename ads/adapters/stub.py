@@ -73,8 +73,12 @@ class StubAdapter:
     ) -> RunResult:
         if "PHASE:plan" in prompt:
             return RunResult(text="stub plan", structured=_PLAN_RESPONSE, exit_status="ok")
-        if "PHASE:validate-judgment" in prompt:
-            judgment_payload: StructuredPayload = {"pass": True, "notes": "stub: looks fine"}
+        if "PHASE:validate-judgment" in prompt or "PHASE:validate-integration" in prompt:
+            judgment_payload: StructuredPayload = {
+                "pass": True,
+                "evidence": "stub: looks fine",
+                "cited_paths": ["stub-evidence.txt"],
+            }
             return RunResult(
                 text=json.dumps(judgment_payload), structured=judgment_payload, exit_status="ok"
             )
