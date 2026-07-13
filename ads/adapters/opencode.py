@@ -136,7 +136,7 @@ class OpenCodeAdapter:
         else:
             sandbox.require(self._policy)  # fail-closed
             env = sandbox.resolve_env(self._policy, os.environ)
-            cmd = sandbox.wrap(cmd, cwd, self._policy, env)
+            cmd = sandbox.wrap_command(cmd, cwd, self._policy, env)
             if self._policy.enabled and self._policy.wall_clock_seconds:
                 # OS-backstop timeout (dec 8); a true scope-kill is
                 # systemd-run's job and the hard-kill -> `killed` outcome

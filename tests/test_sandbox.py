@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -64,6 +65,10 @@ class TestWrapEnabled(unittest.TestCase):
         self.assertEqual(result[0], "bwrap")
         self.assertIn("--unshare-net", result)
         self.assertIn("--clearenv", result)
+        proc_idx = result.index("--proc")
+        self.assertEqual(result[proc_idx + 1], "/proc")
+        dev_idx = result.index("--dev")
+        self.assertEqual(result[dev_idx + 1], "/dev")
         cwd_str = str(_cwd())
         self.assertIn("--bind", result)
         bind_idx = result.index("--bind")
@@ -120,12 +125,44 @@ class TestWrapEnabled(unittest.TestCase):
         policy = self._policy(mem_max="2G", cpu_quota="150%", tasks_max=512)
         result = sandbox.wrap(["true"], _cwd(), policy, {})
 
-        self.assertEqual(result[:3], ["systemd-run", "--scope", "--quiet"])
+        self.assertEqual(result[:4], ["systemd-run", "--user", "--scope", "--quiet"])
         self.assertIn("--property=MemoryMax=2G", result)
         self.assertIn("--property=CPUQuota=150%", result)
         self.assertIn("--property=TasksMax=512", result)
         # bwrap layer still follows the systemd-run prefix
         self.assertIn("bwrap", result)
+
+    def test_enable_scope_false_omits_systemd_run_even_with_caps(self) -> None:
+        policy = self._policy(mem_max="2G")
+        result = sandbox.wrap(["true"], _cwd(), policy, {}, enable_scope=False)
+
+        self.assertNotIn("systemd-run", result)
+        self.assertEqual(result[0], "bwrap")
+
+    def test_ro_home_paths_bound_when_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "cache"
+            cache_dir.mkdir()
+            policy = self._policy()
+            policy = sandbox.SandboxPolicy(
+                enabled=True,
+                ro_paths=policy.ro_paths,
+                ro_home_paths=(str(cache_dir), "/does-not-exist-ro-home"),
+                mask_paths=policy.mask_paths,
+                env_allowlist=policy.env_allowlist,
+            )
+
+            result = sandbox.wrap(["true"], _cwd(), policy, {})
+
+            ro_bind_pairs = [
+                (result[i + 1], result[i + 2])
+                for i, v in enumerate(result)
+                if v == "--ro-bind"
+            ]
+            self.assertIn((str(cache_dir), str(cache_dir)), ro_bind_pairs)
+            self.assertNotIn(
+                ("/does-not-exist-ro-home", "/does-not-exist-ro-home"), ro_bind_pairs
+            )
 
 
 class TestRequire(unittest.TestCase):
@@ -165,6 +202,87 @@ class TestWrapShell(unittest.TestCase):
         self.assertFalse(use_shell)
         self.assertEqual(argv[-3:], ["/bin/sh", "-c", "pytest -q"])
         self.assertEqual(argv[0], "bwrap")
+
+
+class TestWrapCommand(unittest.TestCase):
+    def test_disabled_policy_is_identity(self) -> None:
+        policy = sandbox.SandboxPolicy(enabled=False)
+        argv = ["pytest", "-q"]
+
+        result = sandbox.wrap_command(argv, _cwd(), policy, {})
+
+        self.assertEqual(result, argv)
+
+    def test_caps_and_scope_available_adds_scope_layer(self) -> None:
+        policy = sandbox.SandboxPolicy(enabled=True, mem_max="2G")
+        with mock.patch.object(sandbox, "scope_available", return_value=True):
+            result = sandbox.wrap_command(["true"], _cwd(), policy, {})
+
+        self.assertEqual(result[:2], ["systemd-run", "--user"])
+
+    def test_caps_and_scope_unavailable_degrades_with_warning(self) -> None:
+        policy = sandbox.SandboxPolicy(enabled=True, mem_max="2G", caps_required=False)
+        with (
+            mock.patch.object(sandbox, "scope_available", return_value=False),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            result = sandbox.wrap_command(["true"], _cwd(), policy, {})
+
+        self.assertNotIn("systemd-run", result)
+        self.assertEqual(result[0], "bwrap")
+        self.assertTrue(any("systemd user scope unavailable" in str(w.message) for w in caught))
+
+    def test_caps_required_and_scope_unavailable_raises(self) -> None:
+        policy = sandbox.SandboxPolicy(enabled=True, mem_max="2G", caps_required=True)
+        with (
+            mock.patch.object(sandbox, "scope_available", return_value=False),
+            self.assertRaises(sandbox.SandboxUnavailable),
+        ):
+            sandbox.wrap_command(["true"], _cwd(), policy, {})
+
+    def test_no_caps_never_probes_scope_available(self) -> None:
+        policy = sandbox.SandboxPolicy(enabled=True)
+        with mock.patch.object(sandbox, "scope_available") as probe:
+            sandbox.wrap_command(["true"], _cwd(), policy, {})
+
+        probe.assert_not_called()
+
+
+class TestScopeAvailable(unittest.TestCase):
+    def test_missing_binary_returns_false(self) -> None:
+        sandbox.scope_available.cache_clear()
+        with mock.patch.object(
+            sandbox.subprocess, "run", side_effect=FileNotFoundError
+        ):
+            self.assertFalse(sandbox.scope_available())
+        sandbox.scope_available.cache_clear()
+
+    def test_timeout_returns_false(self) -> None:
+        sandbox.scope_available.cache_clear()
+        with mock.patch.object(
+            sandbox.subprocess,
+            "run",
+            side_effect=sandbox.subprocess.TimeoutExpired(cmd="systemd-run", timeout=5),
+        ):
+            self.assertFalse(sandbox.scope_available())
+        sandbox.scope_available.cache_clear()
+
+    def test_nonzero_exit_returns_false(self) -> None:
+        sandbox.scope_available.cache_clear()
+        fake = mock.Mock()
+        fake.returncode = 1
+        with mock.patch.object(sandbox.subprocess, "run", return_value=fake):
+            self.assertFalse(sandbox.scope_available())
+        sandbox.scope_available.cache_clear()
+
+    def test_zero_exit_returns_true(self) -> None:
+        sandbox.scope_available.cache_clear()
+        fake = mock.Mock()
+        fake.returncode = 0
+        with mock.patch.object(sandbox.subprocess, "run", return_value=fake):
+            self.assertTrue(sandbox.scope_available())
+        sandbox.scope_available.cache_clear()
 
 
 class TestResolveEnv(unittest.TestCase):
@@ -214,6 +332,7 @@ class TestPolicyFromHarness(unittest.TestCase):
             self.assertEqual(policy.mask_paths, (str(home / ".ssh"),))  # .aws/.config/gh missing
             self.assertEqual(policy.ro_paths, sandbox.DEFAULT_RO_PATHS)
             self.assertEqual(policy.env_allowlist, sandbox.DEFAULT_ENV_ALLOWLIST)
+            self.assertFalse(policy.caps_required)
 
     def test_mask_paths_filtered_to_existing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,6 +347,33 @@ class TestPolicyFromHarness(unittest.TestCase):
             policy = sandbox.policy_from_harness(harness, home=home)
 
             self.assertEqual(policy.mask_paths, ())
+
+    def test_ro_home_paths_expanded_and_existence_filtered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".cargo").mkdir()
+            harness = HarnessConfig(
+                tier_model={"fast": "x", "standard": "x", "deep": "x"},
+                run_cmd=[],
+                capabilities=[],
+                sandbox=SandboxConfig(enabled=True),
+            )
+
+            policy = sandbox.policy_from_harness(harness, home=home)
+
+            self.assertEqual(policy.ro_home_paths, (str(home / ".cargo"),))
+
+    def test_caps_required_parsed_from_config(self) -> None:
+        harness = HarnessConfig(
+            tier_model={"fast": "x", "standard": "x", "deep": "x"},
+            run_cmd=[],
+            capabilities=[],
+            sandbox=SandboxConfig(enabled=True, caps_required=True),
+        )
+
+        policy = sandbox.policy_from_harness(harness)
+
+        self.assertTrue(policy.caps_required)
 
 
 class TestClassifyCmdClean(unittest.TestCase):
@@ -293,8 +439,10 @@ tasks_max = 512
 wall_clock = 600
 tmpfs_size = "1000000"
 ro_paths = ["/usr"]
+ro_home_paths = ["~/.cargo"]
 mask_paths = ["/root/.ssh"]
 env_allowlist = ["PATH"]
+caps_required = true
 """,
                 encoding="utf-8",
             )
@@ -309,8 +457,10 @@ env_allowlist = ["PATH"]
             self.assertEqual(harness.sandbox.wall_clock, 600)
             self.assertEqual(harness.sandbox.tmpfs_size, "1000000")
             self.assertEqual(harness.sandbox.ro_paths, ("/usr",))
+            self.assertEqual(harness.sandbox.ro_home_paths, ("~/.cargo",))
             self.assertEqual(harness.sandbox.mask_paths, ("/root/.ssh",))
             self.assertEqual(harness.sandbox.env_allowlist, ("PATH",))
+            self.assertTrue(harness.sandbox.caps_required)
 
     def test_absent_sandbox_table_defaults_to_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,6 +561,32 @@ class TestRealBwrapIntegration(unittest.TestCase):
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
 
             self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    @unittest.skipUnless(sandbox.is_available(), "bwrap/systemd-run not on PATH")
+    def test_dev_and_proc_and_caps_all_work_via_wrap_command(self) -> None:
+        """Real regression guard for defects #1/#2: /dev/null + /proc must be
+        reachable inside the jail, and a caps-bearing policy must not
+        hard-fail when the rootless systemd --user scope is usable. Degrades
+        (rather than asserting the scope layer) when `scope_available()` is
+        False on this host, since that's a legitimate headless/CI state."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            policy = sandbox.SandboxPolicy(
+                enabled=True, deny_egress=True, mem_max="2G", caps_required=False
+            )
+            argv = sandbox.wrap_command(
+                ["/bin/sh", "-c", "echo x > /dev/null && ls /proc/self >/dev/null && echo OK"],
+                cwd,
+                policy,
+                {},
+            )
+
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("OK", proc.stdout)
 
 
 if __name__ == "__main__":

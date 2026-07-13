@@ -20,8 +20,12 @@ machinery.
 
 from __future__ import annotations
 
+import functools
 import re
 import shutil
+import subprocess
+import sys
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +50,21 @@ DEFAULT_MASK_PATH_TEMPLATES: tuple[str, ...] = (
     "~/.gnupg",
 )
 DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
+# Common toolchain/cache dirs a real task needs read access to (rustup,
+# cargo, npm, pyenv, pip/uv caches, nvm). Deliberately conservative and
+# read-only-bound only — never anything under ~/.config, ~/.ssh, ~/.aws, or
+# other credential-bearing dirs (those stay covered by DEFAULT_MASK_PATH_TEMPLATES).
+DEFAULT_RO_HOME_PATHS: tuple[str, ...] = (
+    "~/.cargo",
+    "~/.rustup",
+    "~/.npm",
+    "~/.pyenv",
+    "~/.cache",
+    "~/.local/share/uv",
+    "~/.nvm",
+)
+
+_SCOPE_PROBE_TIMEOUT_SECONDS = 5
 
 
 class SandboxUnavailable(RuntimeError):
@@ -58,6 +77,7 @@ class SandboxPolicy:
     enabled: bool
     deny_egress: bool = True
     ro_paths: tuple[str, ...] = DEFAULT_RO_PATHS
+    ro_home_paths: tuple[str, ...] = ()
     mask_paths: tuple[str, ...] = ()
     env_allowlist: tuple[str, ...] = DEFAULT_ENV_ALLOWLIST
     mem_max: str | None = None
@@ -65,6 +85,7 @@ class SandboxPolicy:
     tasks_max: int | None = None
     tmpfs_size: str | None = None
     wall_clock_seconds: int | None = None
+    caps_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,11 +100,31 @@ def is_available() -> bool:
 
 def require(policy: SandboxPolicy) -> None:
     """Fail-closed: a configured jail that can't be built must not silently
-    run unwrapped. No-op when the policy is disabled."""
+    run unwrapped. No-op when the policy is disabled. This only checks that
+    `bwrap`/`systemd-run` exist on PATH at all — with no FS jail the policy
+    can never be honored, regardless of `caps_required`. The softer
+    "caps requested but the systemd *user* scope isn't usable" case is
+    handled separately by `wrap_command` (see `scope_available`)."""
     if policy.enabled and not is_available():
         raise SandboxUnavailable(
             "sandbox policy is enabled but `bwrap`/`systemd-run` are not both on PATH"
         )
+
+
+@functools.lru_cache(maxsize=1)
+def scope_available() -> bool:
+    """Impure, cached probe: can we start a rootless `systemd-run --user
+    --scope`? False on hosts with no systemd user manager (headless/CI),
+    without raising."""
+    try:
+        proc = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "true"],
+            capture_output=True,
+            timeout=_SCOPE_PROBE_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
 
 
 def _cap_properties(policy: SandboxPolicy) -> list[str]:
@@ -97,10 +138,22 @@ def _cap_properties(policy: SandboxPolicy) -> list[str]:
     return props
 
 
-def wrap(argv: list[str], cwd: Path, policy: SandboxPolicy, env: Mapping[str, str]) -> list[str]:
+def wrap(
+    argv: list[str],
+    cwd: Path,
+    policy: SandboxPolicy,
+    env: Mapping[str, str],
+    *,
+    enable_scope: bool = True,
+) -> list[str]:
     """Pure: build the fully-wrapped argv for `argv` run at `cwd`. Identity
     passthrough when `policy.enabled` is False, so every non-sandbox
-    environment (and every test that doesn't opt in) is unaffected."""
+    environment (and every test that doesn't opt in) is unaffected.
+
+    `enable_scope` gates whether a set of resource caps actually gets a
+    `systemd-run --user --scope` layer — this function stays pure and never
+    probes the host itself; callers that need the "is a user scope even
+    usable here" decision should go through `wrap_command` instead."""
     if not policy.enabled:
         return list(argv)
 
@@ -108,11 +161,12 @@ def wrap(argv: list[str], cwd: Path, policy: SandboxPolicy, env: Mapping[str, st
 
     scope_prefix: list[str] = []
     cap_properties = _cap_properties(policy)
-    if cap_properties:
+    if enable_scope and cap_properties:
         # Only nest under systemd-run when a resource cap is actually set —
         # environments without cgroup delegation still get the bwrap FS/net
-        # jail with no cgroups layer.
-        scope_prefix = ["systemd-run", "--scope", "--quiet", *cap_properties]
+        # jail with no cgroups layer. `--user` targets the per-user systemd
+        # manager so this works rootless without polkit/root.
+        scope_prefix = ["systemd-run", "--user", "--scope", "--quiet", *cap_properties]
 
     bwrap_cmd: list[str] = ["bwrap", "--die-with-parent", "--unshare-pid"]
     if policy.deny_egress:
@@ -121,7 +175,14 @@ def wrap(argv: list[str], cwd: Path, policy: SandboxPolicy, env: Mapping[str, st
     for key in policy.env_allowlist:
         if key in env:
             bwrap_cmd += ["--setenv", key, env[key]]
+    # `--proc`/`--dev` are bwrap-synthesized minimal virtual mounts (not host
+    # /dev), and mandatory for the jail to be usable: nearly every real
+    # command touches /dev/null or /proc.
+    bwrap_cmd += ["--proc", "/proc", "--dev", "/dev"]
     for path in policy.ro_paths:
+        if Path(path).exists():
+            bwrap_cmd += ["--ro-bind", path, path]
+    for path in policy.ro_home_paths:
         if Path(path).exists():
             bwrap_cmd += ["--ro-bind", path, path]
     if policy.tmpfs_size is not None:
@@ -138,6 +199,47 @@ def wrap(argv: list[str], cwd: Path, policy: SandboxPolicy, env: Mapping[str, st
     return [*scope_prefix, *bwrap_cmd]
 
 
+def _resolve_enable_scope(policy: SandboxPolicy) -> bool:
+    """Impure: decide whether the systemd-run scope layer should be emitted.
+    Caps unset -> irrelevant (wrap() only emits the layer when caps are
+    present anyway). Caps set: probe `scope_available()`; if it's usable,
+    enable it; if not, degrade (warn) or fail-closed per `caps_required`."""
+    if not _cap_properties(policy):
+        return False
+    if scope_available():
+        return True
+    if policy.caps_required:
+        raise SandboxUnavailable(
+            "sandbox policy requires resource caps (caps_required=True) but no "
+            "systemd --user scope is available on this host"
+        )
+    warnings.warn(
+        "resource caps requested but systemd user scope unavailable; running "
+        "bwrap FS/net jail without cgroup caps",
+        stacklevel=3,
+    )
+    print(
+        "[sandbox] resource caps requested but systemd user scope unavailable; "
+        "running bwrap FS/net jail without cgroup caps",
+        file=sys.stderr,
+    )
+    return False
+
+
+def wrap_command(
+    argv: list[str], cwd: Path, policy: SandboxPolicy, env: Mapping[str, str]
+) -> list[str]:
+    """Impure composer: the entry point callers should use instead of raw
+    `wrap`. Resolves whether the cgroup scope layer is actually usable on
+    this host (`scope_available`) and applies the fail-closed/degrade
+    decision (`SandboxPolicy.caps_required`) before delegating to the pure
+    `wrap`. Identity passthrough when `policy.enabled` is False."""
+    if not policy.enabled:
+        return list(argv)
+    enable_scope = _resolve_enable_scope(policy)
+    return wrap(argv, cwd, policy, env, enable_scope=enable_scope)
+
+
 def wrap_shell(
     command: str, cwd: Path, policy: SandboxPolicy, env: Mapping[str, str]
 ) -> tuple[list[str], bool]:
@@ -145,13 +247,14 @@ def wrap_shell(
 
     Returns `(to_run, use_shell)`: when disabled, `([command], True)` —
     identical to today's `subprocess.run(command, shell=True, ...)`. When
-    enabled, `(wrap(["/bin/sh", "-c", command], ...), False)` — the caller
-    must switch to `shell=False` since the shell is now explicit inside the
-    jailed argv.
+    enabled, `(wrap_command(["/bin/sh", "-c", command], ...), False)` — the
+    caller must switch to `shell=False` since the shell is now explicit
+    inside the jailed argv. Delegates to `wrap_command` so the cmd gate gets
+    the same scope-availability degrade/fail-closed treatment as `run()`.
     """
     if not policy.enabled:
         return [command], True
-    return wrap(["/bin/sh", "-c", command], cwd, policy, env), False
+    return wrap_command(["/bin/sh", "-c", command], cwd, policy, env), False
 
 
 def resolve_env(policy: SandboxPolicy, environ: Mapping[str, str]) -> dict[str, str]:
@@ -172,16 +275,23 @@ def policy_from_harness(harness: HarnessConfig, *, home: Path | None = None) -> 
         return SandboxPolicy(enabled=False)
 
     home_dir = home if home is not None else Path.home()
+
+    def _expand(raw: str) -> str:
+        return str(home_dir / raw[2:]) if raw.startswith("~/") else raw
+
     mask_templates = cfg.mask_paths or DEFAULT_MASK_PATH_TEMPLATES
-    expanded_masks = tuple(
-        str(home_dir / raw[2:]) if raw.startswith("~/") else raw for raw in mask_templates
-    )
+    expanded_masks = tuple(_expand(raw) for raw in mask_templates)
     existing_masks = tuple(p for p in expanded_masks if Path(p).exists())
+
+    ro_home_templates = cfg.ro_home_paths or DEFAULT_RO_HOME_PATHS
+    expanded_ro_home = tuple(_expand(raw) for raw in ro_home_templates)
+    existing_ro_home = tuple(p for p in expanded_ro_home if Path(p).exists())
 
     return SandboxPolicy(
         enabled=True,
         deny_egress=cfg.deny_egress,
         ro_paths=cfg.ro_paths or DEFAULT_RO_PATHS,
+        ro_home_paths=existing_ro_home,
         mask_paths=existing_masks,
         env_allowlist=cfg.env_allowlist or DEFAULT_ENV_ALLOWLIST,
         mem_max=cfg.mem_max,
@@ -189,6 +299,7 @@ def policy_from_harness(harness: HarnessConfig, *, home: Path | None = None) -> 
         tasks_max=cfg.tasks_max,
         tmpfs_size=cfg.tmpfs_size,
         wall_clock_seconds=cfg.wall_clock,
+        caps_required=cfg.caps_required,
     )
 
 
@@ -273,6 +384,7 @@ def classify_cmd(command: str) -> CmdVerdict:
 __all__ = [
     "DEFAULT_ENV_ALLOWLIST",
     "DEFAULT_MASK_PATH_TEMPLATES",
+    "DEFAULT_RO_HOME_PATHS",
     "DEFAULT_RO_PATHS",
     "SANDBOX_NATIVE_CAPABILITY",
     "CmdVerdict",
@@ -283,6 +395,8 @@ __all__ = [
     "policy_from_harness",
     "require",
     "resolve_env",
+    "scope_available",
     "wrap",
+    "wrap_command",
     "wrap_shell",
 ]

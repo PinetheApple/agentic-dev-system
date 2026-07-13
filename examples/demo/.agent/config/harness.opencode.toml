@@ -23,3 +23,4 @@ mem_max = "2G"
 cpu_quota = "150%"
 tasks_max = 512
 wall_clock = 600
+caps_required = false

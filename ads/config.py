@@ -34,8 +34,10 @@ class SandboxConfig:
     tasks_max: int | None = None
     wall_clock: int | None = None
     ro_paths: tuple[str, ...] = ()
+    ro_home_paths: tuple[str, ...] = ()
     mask_paths: tuple[str, ...] = ()
     env_allowlist: tuple[str, ...] = ()
+    caps_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,8 +132,10 @@ def _load_sandbox(section: dict[str, Any]) -> SandboxConfig:
         tasks_max=section.get("tasks_max"),
         wall_clock=section.get("wall_clock"),
         ro_paths=tuple(section.get("ro_paths", ())),
+        ro_home_paths=tuple(section.get("ro_home_paths", ())),
         mask_paths=tuple(section.get("mask_paths", ())),
         env_allowlist=tuple(section.get("env_allowlist", ())),
+        caps_required=bool(section.get("caps_required", False)),
     )
 
 
