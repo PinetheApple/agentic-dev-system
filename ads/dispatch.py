@@ -35,7 +35,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ads import resplit, worktree
+from ads import reconcile, resplit, worktree
 from ads import resume as resume_module
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
@@ -196,6 +196,16 @@ def _dispatch_one_isolated(
     with git_lock:
         worktree.commit_all(wt, f"ads: {task.id}")
         outcome = worktree.merge_task_branch(layout.repo, wt, task.owns) if task_ok else None
+
+    if outcome is not None and not outcome.merged:
+        # Auto-reconcile is opt-in by config presence (ads/reconcile.py); when
+        # unconfigured this is a no-op and `outcome` comes back unchanged, so
+        # the halt-to-human path below is identical to pre-reconcile behavior.
+        # Held outside git_lock: the slow adapter.run() must never block other
+        # tasks' merges.
+        outcome = reconcile.attempt(layout, cfg, adapter, task, wt, outcome, git_lock)
+
+    with git_lock:
         if outcome is not None and not outcome.merged:
             _write_reconcile_scratch(layout, task, outcome, wt)
             return task, outcome  # worktree intentionally left intact

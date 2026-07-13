@@ -196,15 +196,3 @@ def remove_worktree(repo: Path, wt: TaskWorktree) -> bool:
     removed = _git(["worktree", "remove", "--force", str(wt.path)], repo)
     deleted = _git(["branch", "-D", wt.branch], repo)
     return removed.returncode == 0 and deleted.returncode == 0
-
-
-def reconcile_stub(*, task_id: str, violation: str, design_md: str) -> None:
-    """Seam for the full auto-reconcile agent (TODO, ticket 006 follow-up).
-
-    Intended shape: a fresh `run()`, handed `design.md` plus both diffs
-    (`MergeOutcome.diff_text` and `.merge_output`), that resolves
-    keep/revert/adjust for the offending task and retries the merge. Not
-    implemented in this increment — tripwires halt to a `reconcile` gate
-    for a human instead; nothing calls this function yet.
-    """
-    raise NotImplementedError(f"auto-reconcile not implemented (task={task_id!r}, {violation=})")
