@@ -1,0 +1,27 @@
+# Reference harness config for a ZERO-COST, NO-LOGIN live OpenCode run
+# (ticket 002 cross-harness proof without paid credentials).
+# Same experts/phases/base as harness.toml — only this file differs.
+# Uses OpenCode's built-in free models (`opencode/*-free`), which need no
+# `opencode providers login`. To target this: copy over harness.toml and pass
+# `--adapter opencode`.
+#
+# `[sandbox]` is disabled here on purpose: the driver-wrap jail uses
+# `--unshare-net`, which would sever `opencode run`'s own network call to the
+# provider. Wrapping the whole model-calling CLI in an egress-deny jail is a
+# real design tension (see ticket 011 fog) — the jail is meant to contain the
+# agent's tool subprocesses, not the LLM transport. For local models
+# (`ollama/*`) the jail can stay on.
+
+[tier_model]
+fast = "opencode/deepseek-v4-flash-free"
+standard = "opencode/nemotron-3-ultra-free"
+deep = "opencode/nemotron-3-ultra-free"
+
+[run]
+cmd = ["opencode", "run"]
+
+[capabilities]
+flags = ["tools", "streaming", "json_output"]
+
+[sandbox]
+enabled = false
