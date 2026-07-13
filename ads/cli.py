@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import cast, get_args
 
-from ads import escalation, sandbox
+from ads import escalation, sandbox, status
 from ads._literal import validate_literal
 from ads.adapters.base import (
     ADAPTER_CLAUDE_CODE,
@@ -78,16 +78,7 @@ def _resolve_run_id(layout_root: RunLayout, explicit: str | None) -> str:
 
 
 def _print_status(layout: RunLayout) -> None:
-    state = load_state(layout)
-    print(f"run:          {layout.run_id}")
-    print(f"phase:        {state.phase}")
-    print(f"review_stage: {state.review_stage}")
-    print(f"gate:         {state.gate}")
-    print(f"halt_reason:  {state.halt_reason}")
-    print(f"tasks:        {state.tasks}")
-    print(f"retry_counts: {state.retry_counts}")
-    print(f"escalations:  {state.escalations}")
-    print(f"updated_at:   {state.updated_at}")
+    print(status.render_plain(status.read_status(layout)), end="")
 
 
 def cmd_start(args: argparse.Namespace) -> None:
@@ -153,7 +144,11 @@ def cmd_status(args: argparse.Namespace) -> None:
     stub_layout = RunLayout(repo=repo, run_id="current")
     run_id = _resolve_run_id(stub_layout, args.run_id)
     layout = RunLayout(repo=repo, run_id=run_id)
-    _print_status(layout)
+    run_status = status.read_status(layout)
+    if args.json:
+        print(status.to_json(run_status))
+    else:
+        print(status.render_plain(run_status), end="")
 
 
 def cmd_escalations(args: argparse.Namespace) -> None:
@@ -240,6 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_reject.set_defaults(func=cmd_reject)
 
     p_status = sub.add_parser("status", help="show run state")
+    p_status.add_argument("--json", action="store_true", help="print machine-readable JSON")
     p_status.set_defaults(func=cmd_status)
 
     p_escalations = sub.add_parser("escalations", help="list open escalation requests")
