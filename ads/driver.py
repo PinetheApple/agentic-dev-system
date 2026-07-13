@@ -6,7 +6,7 @@ what to do next; events.jsonl is write-only audit.
 
 from __future__ import annotations
 
-from ads import dispatch, resplit, validate
+from ads import control, dispatch, resplit, validate
 from ads.adapters.base import Adapter, TaskPayload
 from ads.config import Config
 from ads.layout import RunLayout
@@ -59,10 +59,45 @@ def advance(layout: RunLayout, cfg: Config, adapter: Adapter) -> State:
 
 
 def run_until_halt(layout: RunLayout, cfg: Config, adapter: Adapter) -> State:
-    """Loop advance() until a gate stops us or the run is done."""
+    """Loop advance() until a gate stops us or the run is done.
+
+    Ticket 010: at the TOP of each iteration (the unit boundary), drains
+    ads/control.py's command queue and acts on the result before taking
+    another phase-step — the async-substrate-as-ground-truth control model.
+    """
     state = load_state(layout)
-    while state.phase != "done" and state.gate is None:
+    # The `paused` gate is special: unlike every other gate it must still be
+    # re-checked on entry (via drain, below) because only a drained `resume`
+    # command can clear it — every other gate needs an explicit human
+    # approve/reject/reconcile action outside this loop.
+    while state.phase != "done" and (state.gate is None or state.gate == "paused"):
+        state = _drain_control(layout, state)
+        if state.gate is not None or state.phase == "done":
+            break
+        if state.paused:
+            state = _halt(layout, state, "paused by operator", gate="paused")
+            break
         state = advance(layout, cfg, adapter)
+    return state
+
+
+def _drain_control(layout: RunLayout, state: State) -> State:
+    """Apply every pending control command, then act on the drain signals:
+    `replan_requested` loops the phase back to `plan` (mirrors `reject`'s
+    loopback shape); `pause_requested` is left for the caller (`paused` is
+    already set on `state` by the drain itself, checked by the caller right
+    after this returns so a pause command lands before the next phase-step
+    even within one boundary)."""
+    all_tasks = load_tasks(layout)
+    result = control.drain(layout, state, all_tasks)
+    save_state(layout, state)
+    if result.replan_requested:
+        state.phase = "plan"
+        state.review_stage = None
+        state.gate = None
+        state.replan_scope = None
+        save_state(layout, state)
+        append_event(layout, "control_replan")
     return state
 
 

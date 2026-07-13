@@ -15,7 +15,9 @@ from ads._literal import validate_literal
 
 FRONTMATTER_DELIM = "---"
 
-TaskStatus = Literal["pending", "active", "done", "split", "blocked", "needs-escalation"]
+TaskStatus = Literal[
+    "pending", "active", "done", "split", "blocked", "needs-escalation", "aborted"
+]
 TaskTier = Literal["fast", "standard", "deep"]
 ExitCriterionCheck = Literal["cmd", "judgment"]
 
@@ -352,6 +354,11 @@ def ready_batch(tasks: list[Task]) -> list[Task]:
 
     Concurrency is derived from disjoint `owns`, not a declared flag: two ready
     tasks that touch overlapping paths cannot be batched together.
+
+    Ticket 010: `aborted` is terminal and never `pending`, so an aborted task
+    is naturally excluded here; a dependent of an aborted task also never
+    becomes ready because its `depends_on` id never reaches `done` — abort
+    blocks dependents by construction, no extra bookkeeping needed.
     """
     done_ids = {t.id for t in tasks if t.status == "done"}
     dep_ready = [

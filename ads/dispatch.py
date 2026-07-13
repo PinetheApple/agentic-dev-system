@@ -59,6 +59,12 @@ def run(
 ) -> State:
     batch = ready_batch(all_tasks)
 
+    if state.paused:
+        # Ticket 010: pause is honored inside dispatch too, not just between
+        # driver-loop iterations, so a pause issued mid-run stops new work at
+        # the next batch boundary even within a single advance() call.
+        return halt(layout, state, "paused by operator", gate="paused")
+
     if not batch:
         if all(t.status == "done" for t in all_tasks):
             state.phase = "validate"

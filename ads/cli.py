@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import cast, get_args
 
-from ads import escalation, sandbox, status, tui
+from ads import control, escalation, sandbox, status, tui
 from ads._literal import validate_literal
 from ads.adapters.base import (
     ADAPTER_CLAUDE_CODE,
@@ -92,6 +92,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     start_run(layout, args.task)
     state = load_state(layout)
     state.adapter = adapter_name
+    # Ticket 010: best-effort marker that a foreground process currently
+    # holds this run; mainly feeds the read model today, a future sync-block
+    # would key off it too. Kept minimal — not cleared mid-loop, only here.
+    state.attached = True
     save_state(layout, state)
     run_until_halt(layout, cfg, adapter)
     _print_status(layout)
@@ -105,6 +109,13 @@ def cmd_resume(args: argparse.Namespace) -> None:
     cfg = load_config(layout.config)
     adapter = _build_adapter(_require_adapter_name(args.adapter), cfg)
 
+    # Ticket 010: `driver resume` is both the "resume" control verb (clears
+    # any operator pause) AND the foreground drive that drains it — the
+    # async substrate's own doc says "a foreground `driver resume` drains
+    # them", so this is the one command that enqueues its own resume signal
+    # and immediately drains it, rather than forcing two separate
+    # invocations under the same subcommand name.
+    control.enqueue(layout, control.ControlCommand(verb="resume"))
     run_until_halt(layout, cfg, adapter)
     _print_status(layout)
 
@@ -214,6 +225,51 @@ def cmd_escalate_reject(args: argparse.Namespace) -> None:
     _print_status(layout)
 
 
+def _resolve_layout(args: argparse.Namespace) -> RunLayout:
+    repo = Path(args.repo).resolve()
+    stub_layout = RunLayout(repo=repo, run_id="current")
+    run_id = _resolve_run_id(stub_layout, args.run_id)
+    return RunLayout(repo=repo, run_id=run_id)
+
+
+def _enqueue_and_report(layout: RunLayout, command: control.ControlCommand) -> None:
+    """Ticket 010: async substrate — these commands only append to
+    control.jsonl and print a confirmation + status snapshot. They never
+    drive the loop themselves; a foreground `driver resume` drains them at
+    the next unit boundary, which is the intended async model."""
+    control.enqueue(layout, command)
+    label = f" {command.task_id}" if command.task_id else ""
+    print(f"queued: {command.verb}{label}")
+    _print_status(layout)
+
+
+def cmd_pause(args: argparse.Namespace) -> None:
+    layout = _resolve_layout(args)
+    _enqueue_and_report(layout, control.ControlCommand(verb="pause"))
+
+
+def cmd_replan(args: argparse.Namespace) -> None:
+    layout = _resolve_layout(args)
+    _enqueue_and_report(layout, control.ControlCommand(verb="replan"))
+
+
+def cmd_redirect(args: argparse.Namespace) -> None:
+    layout = _resolve_layout(args)
+    _enqueue_and_report(
+        layout, control.ControlCommand(verb="redirect", task_id=args.task, note=args.note)
+    )
+
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    layout = _resolve_layout(args)
+    _enqueue_and_report(layout, control.ControlCommand(verb="edit", task_id=args.task))
+
+
+def cmd_abort(args: argparse.Namespace) -> None:
+    layout = _resolve_layout(args)
+    _enqueue_and_report(layout, control.ControlCommand(verb="abort", task_id=args.task))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="driver")
     parser.add_argument("--repo", default=".", help="repo root (default: cwd)")
@@ -273,6 +329,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-continue", action="store_true", help="don't auto-advance after rejecting"
     )
     p_esc_reject.set_defaults(func=cmd_escalate_reject)
+
+    p_pause = sub.add_parser("pause", help="queue an operator pause (drained at next boundary)")
+    p_pause.set_defaults(func=cmd_pause)
+
+    p_replan = sub.add_parser("replan", help="queue a full replan loopback to the plan phase")
+    p_replan.set_defaults(func=cmd_replan)
+
+    p_redirect = sub.add_parser("redirect", help="queue a note injected into a task's scratch file")
+    p_redirect.add_argument("task", help="task id to redirect")
+    p_redirect.add_argument("note", help="operator note to inject")
+    p_redirect.set_defaults(func=cmd_redirect)
+
+    p_edit = sub.add_parser(
+        "edit", help="queue a pause so a pending task's file can be hand-edited"
+    )
+    p_edit.add_argument("task", help="task id to edit")
+    p_edit.set_defaults(func=cmd_edit)
+
+    p_abort = sub.add_parser("abort", help="queue an abort for a task (graph bookkeeping only)")
+    p_abort.add_argument("task", help="task id to abort")
+    p_abort.set_defaults(func=cmd_abort)
 
     return parser
 

@@ -19,7 +19,7 @@ from ads.tasks import TaskStatus
 
 Phase = Literal["intake", "plan", "review", "dispatch", "validate", "done"]
 ReviewStage = Literal["spec", "design"]
-Gate = Literal["pending", "blocked", "reconcile", "escalation"]
+Gate = Literal["pending", "blocked", "reconcile", "escalation", "paused"]
 ReplanScope = Literal["design"]
 
 PHASES: tuple[Phase, ...] = get_args(Phase)
@@ -58,6 +58,20 @@ class State:
     # (approve/resume) can't silently switch harness mid-run.
     adapter: AdapterName = DEFAULT_ADAPTER
     updated_at: str = ""
+    # Ticket 010: whether a foreground driver process currently holds this
+    # run (a human is attached, in the sync-block sense). Set by a
+    # foreground drive; false on detached/resume/crash — a later concern,
+    # just the field + round-trip here.
+    attached: bool = False
+    # Ticket 010: operator-requested pause, drained from control.jsonl at a
+    # unit boundary. Distinct from `gate` so pause/resume can toggle without
+    # touching the phase-gate machinery; the driver halts to gate="paused"
+    # when this is True and clears that gate when a drained `resume` flips
+    # it back to False.
+    paused: bool = False
+    # Ticket 010: machine-owned cursor over control.jsonl — count of control
+    # commands already drained, same spirit as `step_counts`.
+    control_cursor: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -100,6 +114,9 @@ class State:
                 ),
             ),
             updated_at=data.get("updated_at", ""),
+            attached=bool(data.get("attached", False)),
+            paused=bool(data.get("paused", False)),
+            control_cursor=int(data.get("control_cursor", 0)),
         )
 
 

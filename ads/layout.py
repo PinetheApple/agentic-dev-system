@@ -62,6 +62,10 @@ class RunLayout:
         return self.root / "events.jsonl"
 
     @property
+    def control_log(self) -> Path:
+        return self.root / "control.jsonl"
+
+    @property
     def current_link(self) -> Path:
         return self.agent / RUNS_DIRNAME / "current"
 
