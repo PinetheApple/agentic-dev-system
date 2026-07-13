@@ -36,16 +36,24 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"], check=True)
 
 
-def _task(task_id: str = "01-a", owns: list[str] | None = None) -> Task:
+def _task(
+    task_id: str = "01-a",
+    owns: list[str] | None = None,
+    exit_criteria: list[ExitCriterion] | None = None,
+) -> Task:
     return Task(
         id=task_id,
         status="pending",
         depends_on=[],
         owns=owns if owns is not None else ["a.py"],
-        exit_criteria=[
-            ExitCriterion(check="cmd", value="pytest tests/test_a.py"),
-            ExitCriterion(check="judgment", value="a.py is idiomatic"),
-        ],
+        exit_criteria=(
+            exit_criteria
+            if exit_criteria is not None
+            else [
+                ExitCriterion(check="cmd", value="pytest tests/test_a.py"),
+                ExitCriterion(check="judgment", value="a.py is idiomatic"),
+            ]
+        ),
         expert="",
         critical=False,
         tier="standard",
@@ -168,7 +176,11 @@ class TestResumeReadSetInPrompt(unittest.TestCase):
         return adapter
 
     def test_fresh_task_prompt_has_no_resume_block(self) -> None:
-        adapter = self._run([_task("01-fresh", owns=["fresh.py"])])
+        # exit_criteria=[]: this test is about resume-context assembly, not
+        # gate evaluation (the 006+007 pre-merge gate calls the adapter
+        # again for a judgment criterion, which would add a second recorded
+        # prompt unrelated to what's under test here).
+        adapter = self._run([_task("01-fresh", owns=["fresh.py"], exit_criteria=[])])
 
         self.assertEqual(len(adapter.prompts), 1)
         prompt = adapter.prompts[0]
@@ -179,7 +191,7 @@ class TestResumeReadSetInPrompt(unittest.TestCase):
         self.assertNotIn("on-disk diff", prompt)
 
     def test_prior_work_task_prompt_carries_full_read_set(self) -> None:
-        task = _task("01-resume", owns=["resume.py"])
+        task = _task("01-resume", owns=["resume.py"], exit_criteria=[])
         scratch_path = self.layout.scratch_dir / f"{task.id}.md"
         scratch_path.write_text(
             "## Objective\n\nImplement a.py.\n\n"

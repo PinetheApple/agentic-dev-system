@@ -3,6 +3,12 @@
 Uses a real temp git repo (no live LLM) so the write-set audit, merge-back,
 and both brakes (git floor, capability floor, critical serialization) are
 exercised against real `git worktree`/`git merge` behavior.
+
+`TestPreMergeGate` covers the 006+007 integration: a task never merges
+dirty — its own `cmd`/`judgment` exit criteria now gate the merge itself,
+evaluated pre-merge in its own worktree (`ads/dispatch.py`'s
+`_gate_and_route`), routing a failure through the same ceiling/resplit
+machinery a blocked/handoff task uses rather than a bare retry counter.
 """
 
 from __future__ import annotations
@@ -16,12 +22,13 @@ import time
 import unittest
 from pathlib import Path
 
+from ads import resplit
 from ads.adapters.base import RunResult
 from ads.config import Config, HarnessConfig, PromptDoc
 from ads.driver import _run_dispatch  # pyright: ignore[reportPrivateUsage]
 from ads.layout import RunLayout
 from ads.state import State
-from ads.task_io import write_task
+from ads.task_io import load_tasks, write_task
 from ads.tasks import ExitCriterion, Task, TaskTier
 
 WORKTREES_ROOT = Path(tempfile.gettempdir()) / "ads-worktrees"
@@ -101,13 +108,19 @@ def _cfg(capabilities: list[str], max_parallel: int = 4) -> Config:
     )
 
 
-def _task(task_id: str, owns: list[str], write_file: str, critical: bool = False) -> Task:
+def _task(
+    task_id: str,
+    owns: list[str],
+    write_file: str,
+    critical: bool = False,
+    exit_cmd: str = "true",
+) -> Task:
     return Task(
         id=task_id,
         status="pending",
         depends_on=[],
         owns=owns,
-        exit_criteria=[ExitCriterion(check="cmd", value="true")],
+        exit_criteria=[ExitCriterion(check="cmd", value=exit_cmd)],
         expert="",
         critical=critical,
         tier="standard",
@@ -249,6 +262,101 @@ class TestDispatchWorktreeIsolation(unittest.TestCase):
 
         self.assertIsNone(result_state.gate)
         self.assertEqual(adapter.max_active, 1)  # critical x critical always serialized
+
+
+class TestPreMergeGate(unittest.TestCase):
+    """A task never merges dirty: its own exit-criteria gate runs in its own
+    worktree BEFORE `merge_task_branch`, not post-merge in `validate`."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        self.run_id = f"run-{self.id().split('.')[-1]}"
+        self.layout = RunLayout(repo=self.repo, run_id=self.run_id)
+        self.layout.scaffold()
+        self.layout.design.write_text("# Design\n", encoding="utf-8")
+        self.addCleanup(shutil.rmtree, WORKTREES_ROOT / self.run_id, True)
+
+    def _write_tasks(self, tasks: list[Task]) -> State:
+        for task in tasks:
+            write_task(self.layout, task)
+        return State(phase="dispatch", tasks={t.id: t.status for t in tasks})
+
+    def test_passing_gate_merges_and_marks_done(self) -> None:
+        _init_git_repo(self.repo)
+        task = _task("01-a", owns=["a.py"], write_file="a.py", exit_cmd="test -f a.py")
+        state = self._write_tasks([task])
+        adapter = WritingAdapter(capabilities=[])
+
+        result_state = _run_dispatch(self.layout, _cfg(capabilities=[]), adapter, state)
+
+        self.assertIsNone(result_state.gate)
+        self.assertEqual(result_state.tasks["01-a"], "done")
+        self.assertTrue((self.repo / "a.py").exists())  # merged onto the integration branch
+        log = subprocess.run(
+            ["git", "-C", str(self.repo), "log", "--oneline"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("01-a", log.stdout)
+
+    def test_failing_gate_blocks_merge_and_resets_to_pending(self) -> None:
+        _init_git_repo(self.repo)
+        # The task claims done and writes its file, but its own exit
+        # criterion always fails -> gate must refuse the merge.
+        task = _task("01-a", owns=["a.py"], write_file="a.py", exit_cmd="false")
+        state = self._write_tasks([task])
+        adapter = WritingAdapter(capabilities=[])
+        base_sha_before = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        result_state = _run_dispatch(self.layout, _cfg(capabilities=[]), adapter, state)
+
+        self.assertIsNone(result_state.gate)  # not a reconcile tripwire, an ordinary re-route
+        self.assertEqual(result_state.tasks["01-a"], "pending")
+        self.assertFalse((self.repo / "a.py").exists())  # never merged
+        head_after = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(base_sha_before, head_after)  # integration branch HEAD unchanged
+
+        feedback = (self.layout.scratch_dir / "01-a.md").read_text(encoding="utf-8")
+        self.assertIn("Validation feedback", feedback)
+        self.assertIn("FAIL", feedback)
+
+        # worktree cleaned up, not left on disk (this isn't a reconcile tripwire)
+        leftover = list((WORKTREES_ROOT / self.run_id).glob("01-a-*"))
+        self.assertEqual(leftover, [])
+
+    def test_repeated_gate_failure_breaches_ceiling_and_resplits(self) -> None:
+        _init_git_repo(self.repo)
+        task = _task("01-a", owns=["a.py"], write_file="a.py", exit_cmd="false")
+        state = self._write_tasks([task])
+        adapter = WritingAdapter(capabilities=[])
+        cfg = _cfg(capabilities=[])
+
+        for _ in range(resplit.STEP_CEILING):
+            state = _run_dispatch(self.layout, cfg, adapter, state)
+
+        self.assertIsNone(state.gate)
+        self.assertEqual(state.tasks["01-a"], "split")
+        self.assertEqual(state.tasks["01-a-r1"], "pending")
+
+        all_tasks = load_tasks(self.layout)
+        parent = next(t for t in all_tasks if t.id == "01-a")
+        child = next(t for t in all_tasks if t.id == "01-a-r1")
+        self.assertEqual(parent.status, "split")
+        self.assertEqual(child.parent, "01-a")
+        self.assertFalse((self.repo / "a.py").exists())  # never merged across all attempts
 
 
 if __name__ == "__main__":

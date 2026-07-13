@@ -1,31 +1,32 @@
-"""Validation phase mechanics (ticket 007): the three gates over a task's
-typed `exit_criteria` (ticket 003), plus the per-run integration critic.
-
-Three gates, all author-agnostic and forgery-proof:
+"""Validation mechanics (ticket 007) + the 006+007 integration follow-up: a
+task never merges dirty. Three gates, all author-agnostic and forgery-proof:
 
 1. **`cmd` gate** — a driver-executed subprocess; the real exit code is the
-   verdict. Runs in the task's still-on-disk worktree if one exists, else
-   the target repo (`worktree.find_worktree_dir`).
-2. **`judgment` gate** — a fresh, cold critic `run()` given spec.md + the
-   task's on-disk owns-diff ONLY (`resume.owns_diff`) — never the author's
-   scratch/self-summary. Output is a structured `{pass, evidence,
+   verdict. Runs at an explicit, caller-supplied `cwd` (`_run_cmd_criterion`)
+   — the task's live worktree pre-merge (`ads/dispatch.py`), or the target
+   repo for the in-place fallback.
+2. **`judgment` gate** — a fresh, cold critic `run()` given spec.md + an
+   explicit, caller-supplied diff (`_run_judgment_criterion`) — never the
+   author's scratch/self-summary. Output is a structured `{pass, evidence,
    cited_paths}` verdict; a `pass: true` with empty `cited_paths` is
    auto-failed here, not left to the critic's honor (`_parse_verdict`).
 3. **integration critic** — one extra critic `run()` over the whole
    `spec.md` + the full merged run diff (`resume.owns_diff(repo, ["."])`,
    ticket 005's root-commit-to-worktree ground truth), run once after every
-   leaf passes and before the run reaches `done`. Catches cross-task seam
-   gaps no single leaf's own gate would see.
+   task's own gates have already passed pre-merge and before the run reaches
+   `done`. Catches cross-task seam gaps no single task's own gate would see.
+   This is the one gate that is deliberately still post-merge — it needs
+   every task merged to see cross-task seams.
 
-`ads/driver.py` owns the retry-bounded state machine (write feedback, reset
-tasks to pending, loop back to `dispatch`, halt after 2 rounds); this module
-only evaluates criteria/verdicts and writes the audit trail
-(`validation-report.md`).
-
-Deferred (ticket 007, explicitly out of scope for this increment): gates
-currently run post-merge, in the separate `validate` phase — before-merge
-resequencing (a task never merges dirty) is a 006+007 integration
-follow-up, not built here.
+Per-task gates now run pre-merge, in `ads/dispatch.py`, via the public
+`evaluate_task_at(..., cwd=..., diff_text=...)` entry point below: this
+module remains the home of the gate MECHANICS (criteria evaluation, verdict
+parsing, feedback/report writing); only the call site — and the cwd/diff it
+threads through — moved to before `merge_task_branch`. `ads/driver.py` owns
+the retry-bounded state machine around the post-merge integration critic
+only (write feedback, reset attributed tasks to pending, loop back to
+`dispatch`, halt after 2 rounds); this module only evaluates
+criteria/verdicts and writes the audit trail (`validation-report.md`).
 """
 
 from __future__ import annotations
@@ -85,24 +86,43 @@ class IntegrationVerdict:
 # ---------------------------------------------------------------------------
 
 
-def evaluate_task(layout: RunLayout, cfg: Config, adapter: Adapter, task: Task) -> TaskValidation:
+def evaluate_task_at(
+    layout: RunLayout,
+    cfg: Config,
+    adapter: Adapter,
+    task: Task,
+    *,
+    cwd: Path,
+    diff_text: str,
+) -> TaskValidation:
+    """Evaluate `task`'s exit criteria at an explicit `cwd` (for `cmd`
+    criteria) and `diff_text` (for `judgment` criteria) — both supplied by
+    the caller rather than self-computed, so this works identically whether
+    called pre-merge from a live worktree (`ads/dispatch.py`) or from the
+    in-place, non-git fallback."""
     results = [
-        _evaluate_criterion(layout, cfg, adapter, task, criterion)
+        _evaluate_criterion(layout, cfg, adapter, task, criterion, cwd=cwd, diff_text=diff_text)
         for criterion in task.exit_criteria
     ]
     return TaskValidation(task=task, results=results)
 
 
 def _evaluate_criterion(
-    layout: RunLayout, cfg: Config, adapter: Adapter, task: Task, criterion: ExitCriterion
+    layout: RunLayout,
+    cfg: Config,
+    adapter: Adapter,
+    task: Task,
+    criterion: ExitCriterion,
+    *,
+    cwd: Path,
+    diff_text: str,
 ) -> CriterionResult:
     if criterion.check == "cmd":
-        return _run_cmd_criterion(layout, task, criterion)
-    return _run_judgment_criterion(layout, cfg, adapter, task, criterion)
+        return _run_cmd_criterion(cwd, criterion)
+    return _run_judgment_criterion(layout, cfg, adapter, task, criterion, diff_text=diff_text)
 
 
-def _run_cmd_criterion(layout: RunLayout, task: Task, criterion: ExitCriterion) -> CriterionResult:
-    cwd = worktree.find_worktree_dir(layout.run_id, task.id) or layout.repo
+def _run_cmd_criterion(cwd: Path, criterion: ExitCriterion) -> CriterionResult:
     try:
         proc = subprocess.run(
             criterion.value,
@@ -122,9 +142,14 @@ def _run_cmd_criterion(layout: RunLayout, task: Task, criterion: ExitCriterion) 
 
 
 def _run_judgment_criterion(
-    layout: RunLayout, cfg: Config, adapter: Adapter, task: Task, criterion: ExitCriterion
+    layout: RunLayout,
+    cfg: Config,
+    adapter: Adapter,
+    task: Task,
+    criterion: ExitCriterion,
+    *,
+    diff_text: str,
 ) -> CriterionResult:
-    diff_text = resume_module.owns_diff(layout.repo, task.owns)
     task_body = (
         cfg.phases["validate"]
         .body.replace("{criterion}", criterion.value)

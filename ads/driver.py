@@ -18,7 +18,6 @@ from ads.tasks import CycleError, ExitCriterion, Task, check_acyclic
 
 MAX_RETRIES = 2
 REVIEW_TO_PLAN = "review_to_plan"
-VALIDATE_TO_DISPATCH = "validate_to_dispatch"
 VALIDATE_INTEGRATION = "validate_integration"
 MISSING_WORK = "missing_work"
 
@@ -199,34 +198,20 @@ def _run_dispatch(layout: RunLayout, cfg: Config, adapter: Adapter, state: State
 
 
 # ---------------------------------------------------------------------------
-# validate (ticket 007: cmd gate + judgment critic + integration critic —
-# see ads/validate.py for the gate mechanics; this is only the retry-bounded
-# state machine around them, mirroring the review gate's evaluator-optimizer
-# shape below)
+# validate (ticket 007 + 006+007 integration: per-task `cmd`/`judgment` gates
+# now run pre-merge in ads/dispatch.py — a task never merges dirty — so this
+# phase is purely the post-merge integration critic: the one deliberately
+# cross-task check that needs every task already merged. See ads/validate.py
+# for the gate mechanics; this is only the retry-bounded state machine
+# around the integration critic, mirroring the review gate's
+# evaluator-optimizer shape below)
 # ---------------------------------------------------------------------------
 
 
 def _run_validate(layout: RunLayout, cfg: Config, adapter: Adapter, state: State) -> State:
     all_tasks = load_tasks(layout)
-    task_validations = [validate.evaluate_task(layout, cfg, adapter, t) for t in all_tasks]
-    failed_task_ids = [tv.task.id for tv in task_validations if not tv.passed]
-
-    if failed_task_ids:
-        validate.write_report(layout, task_validations, integration=None)
-        for tv in task_validations:
-            if not tv.passed:
-                validate.write_task_feedback(layout, tv)
-        return _retry_validate(
-            layout,
-            state,
-            all_tasks,
-            failed_task_ids,
-            VALIDATE_TO_DISPATCH,
-            f"{VALIDATE_TO_DISPATCH} retries exhausted: {failed_task_ids}",
-        )
-
     integration = validate.run_integration_critic(layout, cfg, adapter)
-    validate.write_report(layout, task_validations, integration=integration)
+    validate.write_report(layout, [], integration=integration)
 
     if not integration.passed:
         attributed = validate.attribute_paths(all_tasks, integration.cited_paths)

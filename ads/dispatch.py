@@ -21,12 +21,16 @@ harness performs natively inside one `run()` call is a non-load-bearing
 accelerator ADS never depends on or drives; nothing here builds or calls
 into such a mechanism.
 
-TODO(ticket-007 follow-up): a task's merge here happens before its `cmd`/
-`judgment` exit criteria are checked (`ads/validate.py` runs in the separate,
-later `validate` phase) — i.e. gates currently run post-merge, not
-pre-merge. Ticket 007's "a task never merges dirty" sequencing would move
-the per-task gate check into this module, before `merge_task_branch`. Not
-built in this increment; kept as a separate, deliberately post-merge phase.
+Ticket 006+007 integration: a task never merges dirty. Before either
+strategy calls `merge_task_branch` (isolated) or folds a `done` result into
+state (in-place), `_gate_and_route` evaluates the task's own `cmd`/
+`judgment` exit criteria (`ads/validate.py`'s `evaluate_task_at`) at the
+task's own worktree/diff. Only a passing task merges; a failing one is
+routed through the same ceiling/resplit machinery `_apply_run_result` uses
+for a blocked/handoff task, never merged dirty. The cross-task integration
+critic remains the one deliberately post-merge check — it runs once over
+every task's merged work in the later `validate` phase, where it can see
+cross-task seams no single task's own gate would.
 """
 
 from __future__ import annotations
@@ -34,8 +38,9 @@ from __future__ import annotations
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-from ads import reconcile, resplit, worktree
+from ads import reconcile, resplit, validate, worktree
 from ads import resume as resume_module
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
@@ -98,6 +103,22 @@ def _dispatch_inplace(
 
         try:
             _apply_run_result(layout, state, task, result)
+            if task.status == "done":
+                # Parity with the isolated path: there's no merge here (no
+                # git floor), but a task's own gates must still be enforced
+                # pre-"done" now that validate no longer checks them. Degraded
+                # best-effort: the in-place changes already landed and can't
+                # be un-applied, but a gate failure still re-routes the task
+                # to pending/split for a bounded retry.
+                _gate_and_route(
+                    layout,
+                    cfg,
+                    adapter,
+                    state,
+                    task,
+                    cwd=layout.repo,
+                    diff_text=resume_module.owns_diff(layout.repo, task.owns),
+                )
         except resplit.ResplitDepthExceeded as exc:
             return halt(layout, state, str(exc))
         critical_blocked = critical_blocked or (task.critical and task.status == "blocked")
@@ -161,6 +182,49 @@ def _apply_run_result(layout: RunLayout, state: State, task: Task, result: RunRe
     state.tasks[task.id] = task.status
 
 
+def _gate_and_route(
+    layout: RunLayout,
+    cfg: Config,
+    adapter: Adapter,
+    state: State,
+    task: Task,
+    *,
+    cwd: Path,
+    diff_text: str,
+) -> bool:
+    """Ticket 006+007 integration (a task never merges dirty): evaluate
+    `task`'s exit criteria at `(cwd, diff_text)` before the caller merges.
+
+    On pass, returns `True` and leaves `task`/`state` untouched — the caller
+    proceeds to merge. On fail, writes gate feedback to scratch via
+    `validate.write_task_feedback` (Rule 4 read-set: lands where the next
+    dispatch attempt's resume context is assembled from) and routes the task
+    as a non-success through the same ceiling/resplit
+    machinery `_apply_run_result` uses for a blocked/handoff task — never a
+    new, separate retry counter: a breached `STEP_CEILING` re-splits into a
+    residual child, otherwise the task resets to `pending` for a bounded
+    re-dispatch (`state.step_counts` was already incremented at dispatch
+    start, so this bounds total attempts exactly like the existing
+    blocked/handoff loop). Returns `False`; the caller must NOT merge.
+
+    May raise `resplit.ResplitDepthExceeded` — the caller lets it propagate
+    to the driver's existing halt-to-human handling.
+    """
+    tv = validate.evaluate_task_at(layout, cfg, adapter, task, cwd=cwd, diff_text=diff_text)
+    if tv.passed:
+        return True
+
+    validate.write_task_feedback(layout, tv)
+    if resplit.breached_ceiling(state.step_counts.get(task.id, 0)):
+        child = resplit.perform(layout, task)  # writes both task files, seeds child scratch
+        state.tasks[child.id] = child.status
+    else:
+        task.status = "pending"
+        write_task(layout, task)
+        state.tasks[task.id] = "pending"
+    return False
+
+
 def _dispatch_one_isolated(
     layout: RunLayout,
     cfg: Config,
@@ -172,16 +236,19 @@ def _dispatch_one_isolated(
     base_sha: str,
     git_lock: threading.Lock,
 ) -> tuple[Task, MergeOutcome | None]:
-    """Run one task in its own worktree; commit + audit + merge back.
+    """Run one task in its own worktree; commit + gate + audit + merge back.
 
     Returns `(task-with-updated-status, tripwire-outcome)`. A non-`None`
-    outcome means a tripwire fired: the worktree is left on disk (not
-    cleaned up) and the caller must halt to the `reconcile` gate rather
-    than treat this as an ordinary blocked task.
+    outcome means a reconcile tripwire fired: the worktree is left on disk
+    (not cleaned up) and the caller must halt to the `reconcile` gate rather
+    than treat this as an ordinary blocked task. A task whose own exit-
+    criteria gate fails pre-merge is an ordinary `(task, None)` return — it
+    was already routed to `pending`/`split` by `_gate_and_route`, not a
+    reconcile tripwire.
 
-    May raise `resplit.ResplitDepthExceeded` (from `_apply_run_result`) when
-    a budget/handoff re-split's lineage is already at the cap; the caller
-    halts to a human.
+    May raise `resplit.ResplitDepthExceeded` (from `_apply_run_result` or
+    `_gate_and_route`) when a budget/handoff re-split's lineage is already
+    at the cap; the caller halts to a human.
     """
     resume_module.scaffold_scratch(layout, task)
     prompt, allowed_tools = _compose_task_prompt(cfg, layout, task, spec_text, design_text)
@@ -195,9 +262,34 @@ def _dispatch_one_isolated(
 
     with git_lock:
         worktree.commit_all(wt, f"ads: {task.id}")
-        outcome = worktree.merge_task_branch(layout.repo, wt, task.owns) if task_ok else None
 
-    if outcome is not None and not outcome.merged:
+    if not task_ok:
+        # Nothing claims done -> no gate to run, exactly today's behavior:
+        # _apply_run_result routes to blocked/resplit, never merges.
+        with git_lock:
+            _apply_run_result(layout, state, task, result)
+        return task, None
+
+    # A task never merges dirty (ticket 006+007): evaluate its own exit
+    # criteria in its own worktree BEFORE merge-back. Held outside git_lock
+    # like reconcile.attempt below — a slow judgment-critic adapter.run()
+    # must never block other tasks' merges.
+    passed = _gate_and_route(
+        layout, cfg, adapter, state, task, cwd=wt.path, diff_text=worktree.full_diff(wt)
+    )
+    if not passed:
+        with git_lock:
+            if not worktree.remove_worktree(layout.repo, wt):
+                print(
+                    f"warning: failed to clean up worktree for {task.id}: {wt.path}",
+                    file=sys.stderr,
+                )
+        return task, None  # routed to pending/split by _gate_and_route; not a reconcile tripwire
+
+    with git_lock:
+        outcome = worktree.merge_task_branch(layout.repo, wt, task.owns)
+
+    if not outcome.merged:
         # Auto-reconcile is opt-in by config presence (ads/reconcile.py); when
         # unconfigured this is a no-op and `outcome` comes back unchanged, so
         # the halt-to-human path below is identical to pre-reconcile behavior.
@@ -206,7 +298,7 @@ def _dispatch_one_isolated(
         outcome = reconcile.attempt(layout, cfg, adapter, task, wt, outcome, git_lock)
 
     with git_lock:
-        if outcome is not None and not outcome.merged:
+        if not outcome.merged:
             _write_reconcile_scratch(layout, task, outcome, wt)
             return task, outcome  # worktree intentionally left intact
         if not worktree.remove_worktree(layout.repo, wt):

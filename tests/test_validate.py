@@ -1,7 +1,11 @@
-"""Ticket 007: the validate phase's three gates — grounded `cmd` gate,
-judgment critic (with structural anti-rubber-stamp enforcement), and the
-per-run integration critic — plus the retry-bounded state machine around
-them in `ads/driver.py`.
+"""Ticket 007 + the 006+007 integration follow-up: the gate MECHANICS —
+grounded `cmd` gate, judgment critic (with structural anti-rubber-stamp
+enforcement) — via `evaluate_task_at`'s explicit `cwd`/`diff_text`, plus the
+post-merge integration critic and its retry-bounded state machine in
+`ads/driver.py`. Per-task gate *routing* (pass -> merge, fail -> pending/
+resplit) now lives in `ads/dispatch.py` and is covered by
+`tests/test_dispatch_worktree.py`; this file covers the gate mechanics
+directly and the integration critic's still-post-merge behavior.
 
 Uses a `ScriptedAdapter` (test-only) so each critic call's verdict is fully
 controlled, and a stub adapter's task-status shape for `cmd`-only dispatch
@@ -10,7 +14,6 @@ where a real run() isn't needed.
 
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,7 +72,7 @@ class ScriptedAdapter:
             payload = self._judgment_payload
         else:
             payload = {"status": "done", "summary": "scripted dispatch"}
-        return RunResult(text=json.dumps(payload), structured=payload, exit_status="ok")
+        return RunResult(text="{}", structured=payload, exit_status="ok")
 
 
 def _cfg() -> Config:
@@ -121,15 +124,19 @@ class TestCmdGate(ValidateTestCase):
     def test_passing_and_failing_cmd_captured_in_report(self) -> None:
         ok_task = _task("01-ok", [ExitCriterion(check="cmd", value="true")], owns=["a.py"])
         bad_task = _task("02-bad", [ExitCriterion(check="cmd", value="false")], owns=["b.py"])
-        state = self._write(ok_task, bad_task)
         adapter = ScriptedAdapter()
 
-        result = _run_validate(self.layout, self.cfg, adapter, state)
+        ok_tv = validate.evaluate_task_at(
+            self.layout, self.cfg, adapter, ok_task, cwd=self.repo, diff_text=""
+        )
+        bad_tv = validate.evaluate_task_at(
+            self.layout, self.cfg, adapter, bad_task, cwd=self.repo, diff_text=""
+        )
 
-        self.assertEqual(result.tasks["01-ok"], "done")
-        self.assertEqual(result.tasks["02-bad"], "pending")  # reset, loop back to dispatch
-        self.assertEqual(result.phase, "dispatch")
+        self.assertTrue(ok_tv.passed)
+        self.assertFalse(bad_tv.passed)
 
+        validate.write_report(self.layout, [ok_tv, bad_tv], integration=None)
         report = (self.layout.root / validate.REPORT_FILENAME).read_text(encoding="utf-8")
         self.assertIn("01-ok — PASS", report)
         self.assertIn("02-bad — FAIL", report)
@@ -137,6 +144,7 @@ class TestCmdGate(ValidateTestCase):
         self.assertIn("exit=1", report)
         self.assertIn("not run — task-level exit criteria failed first", report)
 
+        validate.write_task_feedback(self.layout, bad_tv)
         feedback = (self.layout.scratch_dir / "02-bad.md").read_text(encoding="utf-8")
         self.assertIn("Validation feedback", feedback)
         self.assertIn("FAIL", feedback)
@@ -152,7 +160,9 @@ class TestJudgmentCritic(ValidateTestCase):
             judgment_payload={"pass": True, "evidence": "clean", "cited_paths": ["x.py"]}
         )
 
-        tv = validate.evaluate_task(self.layout, self.cfg, adapter, task)
+        tv = validate.evaluate_task_at(
+            self.layout, self.cfg, adapter, task, cwd=self.repo, diff_text="diff --git a/x.py..."
+        )
 
         self.assertTrue(tv.passed)
         self.assertEqual(tv.results[0].cited_paths, ["x.py"])
@@ -163,7 +173,9 @@ class TestJudgmentCritic(ValidateTestCase):
             judgment_payload={"pass": True, "evidence": "trust me", "cited_paths": []}
         )
 
-        tv = validate.evaluate_task(self.layout, self.cfg, adapter, task)
+        tv = validate.evaluate_task_at(
+            self.layout, self.cfg, adapter, task, cwd=self.repo, diff_text=""
+        )
 
         self.assertFalse(tv.passed)  # the anti-rubber-stamp case
         self.assertIn("AUTO-FAIL", tv.results[0].detail)
@@ -174,67 +186,18 @@ class TestJudgmentCritic(ValidateTestCase):
             judgment_payload={"pass": False, "evidence": "missing tests", "cited_paths": []}
         )
 
-        tv = validate.evaluate_task(self.layout, self.cfg, adapter, task)
+        tv = validate.evaluate_task_at(
+            self.layout, self.cfg, adapter, task, cwd=self.repo, diff_text=""
+        )
 
         self.assertFalse(tv.passed)
         self.assertEqual(tv.results[0].detail, "missing tests")
 
 
-class TestDefinitionOfDone(ValidateTestCase):
-    def test_passing_cmd_and_cited_judgment_reaches_done(self) -> None:
-        task = _task(
-            "01-both",
-            [
-                ExitCriterion(check="cmd", value="true"),
-                ExitCriterion(check="judgment", value="clean code"),
-            ],
-        )
-        state = self._write(task)
-        adapter = ScriptedAdapter(
-            judgment_payload={"pass": True, "evidence": "clean", "cited_paths": ["x.py"]},
-            integration_payload=PASS_PAYLOAD,
-        )
-
-        result = _run_validate(self.layout, self.cfg, adapter, state)
-
-        self.assertEqual(result.phase, "done")
-        self.assertIsNone(result.gate)
-
-    def test_either_failing_resets_to_pending_and_exhausts_after_two_rounds(self) -> None:
-        task = _task(
-            "01-both",
-            [
-                ExitCriterion(check="cmd", value="true"),
-                ExitCriterion(check="judgment", value="clean code"),
-            ],
-        )
-        state = self._write(task)
-        adapter = ScriptedAdapter(
-            judgment_payload={"pass": False, "evidence": "sloppy", "cited_paths": []}
-        )
-
-        for _ in range(MAX_RETRIES):
-            state.phase = "validate"
-            task.status = "done"
-            write_task(self.layout, task)
-            state.tasks[task.id] = "done"
-            state = _run_validate(self.layout, self.cfg, adapter, state)
-            self.assertEqual(state.tasks[task.id], "pending")
-            self.assertEqual(state.phase, "dispatch")
-            self.assertIsNone(state.gate)
-
-        state.phase = "validate"
-        task.status = "done"
-        write_task(self.layout, task)
-        state.tasks[task.id] = "done"
-        state = _run_validate(self.layout, self.cfg, adapter, state)
-
-        self.assertEqual(state.gate, "blocked")
-        assert state.halt_reason is not None
-        self.assertIn("exhausted", state.halt_reason)
-
-
 class TestIntegrationCritic(ValidateTestCase):
+    """The integration critic is the one gate that stays post-merge — run
+    once over the full merged diff, in the `validate` phase."""
+
     def test_runs_once_after_all_leaves_pass_and_reaches_done(self) -> None:
         task = _task("01-ok", [ExitCriterion(check="cmd", value="true")])
         state = self._write(task)
@@ -299,6 +262,37 @@ class TestIntegrationCritic(ValidateTestCase):
         assert result.halt_reason is not None
         self.assertIn("no cited paths", result.halt_reason)
         self.assertEqual(result.tasks["01-ok"], "done")  # not touched: nothing to retry
+
+    def test_exhausts_retry_after_two_rounds(self) -> None:
+        task = _task("01-ok", [ExitCriterion(check="cmd", value="true")], owns=["a.py"])
+        state = self._write(task)
+        adapter = ScriptedAdapter(
+            integration_payload={
+                "pass": False,
+                "evidence": "still broken",
+                "cited_paths": ["a.py"],
+            }
+        )
+
+        for _ in range(MAX_RETRIES):
+            state.phase = "validate"
+            task.status = "done"
+            write_task(self.layout, task)
+            state.tasks[task.id] = "done"
+            state = _run_validate(self.layout, self.cfg, adapter, state)
+            self.assertEqual(state.tasks[task.id], "pending")
+            self.assertEqual(state.phase, "dispatch")
+            self.assertIsNone(state.gate)
+
+        state.phase = "validate"
+        task.status = "done"
+        write_task(self.layout, task)
+        state.tasks[task.id] = "done"
+        state = _run_validate(self.layout, self.cfg, adapter, state)
+
+        self.assertEqual(state.gate, "blocked")
+        assert state.halt_reason is not None
+        self.assertIn("exhausted", state.halt_reason)
 
 
 if __name__ == "__main__":

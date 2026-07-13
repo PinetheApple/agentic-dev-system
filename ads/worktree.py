@@ -142,21 +142,6 @@ def uncovered_files(paths: list[str], owns: list[str]) -> list[str]:
     return [p for p in paths if not any(covers(p, entry) for entry in owns)]
 
 
-def find_worktree_dir(run_id: str, task_id: str) -> Path | None:
-    """Locate a task's still-on-disk worktree, if any (ticket 007 cmd gate:
-    grounded checks run there when present, so they see exactly what the
-    task produced). Clean tasks have no worktree left by the time validate
-    runs — `remove_worktree` deletes it on merge — so this is only non-None
-    for the rare case a worktree was intentionally left behind (e.g. a
-    reconcile tripwire, or the in-place/non-git dispatch path never made
-    one at all)."""
-    base_dir = Path(tempfile.gettempdir()) / "ads-worktrees" / run_id
-    if not base_dir.exists():
-        return None
-    matches = sorted(base_dir.glob(f"{task_id}-*"))
-    return matches[0] if matches else None
-
-
 def merge_task_branch(repo: Path, wt: TaskWorktree, owns: list[str]) -> MergeOutcome:
     """Run both tripwires and merge if clean. A failed `git merge` is always
     aborted, so the integration branch is never left half-merged."""
