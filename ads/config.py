@@ -13,12 +13,17 @@ from typing import Any, cast
 
 FRONTMATTER_DELIM = "---"
 
+# `[capabilities] max_parallel` in harness.toml is numeric tuning fog — wire
+# the knob, default a small cap when unset (ticket 006).
+DEFAULT_MAX_PARALLEL = 4
+
 
 @dataclass(frozen=True)
 class HarnessConfig:
     tier_model: dict[str, str]
     run_cmd: list[str]
     capabilities: list[str]
+    max_parallel: int = DEFAULT_MAX_PARALLEL
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,7 @@ def _load_harness(path: Path) -> HarnessConfig:
         tier_model=dict(raw.get("tier_model", {})),
         run_cmd=list(run_section.get("cmd", [])),
         capabilities=list(capabilities_section.get("flags", [])),
+        max_parallel=int(capabilities_section.get("max_parallel", DEFAULT_MAX_PARALLEL)),
     )
 
 

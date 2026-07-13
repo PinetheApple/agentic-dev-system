@@ -19,7 +19,7 @@ from ads.tasks import TaskStatus
 
 Phase = Literal["intake", "plan", "review", "dispatch", "validate", "done"]
 ReviewStage = Literal["spec", "design"]
-Gate = Literal["pending", "blocked"]
+Gate = Literal["pending", "blocked", "reconcile"]
 ReplanScope = Literal["design"]
 
 PHASES: tuple[Phase, ...] = get_args(Phase)
@@ -114,3 +114,14 @@ def append_event(layout: RunLayout, kind: str, **payload: Any) -> None:
     }
     with layout.events.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def halt(layout: RunLayout, state: State, reason: str, gate: Gate = "blocked") -> State:
+    """Shared halt helper: every phase runner (plan/dispatch/validate) stops
+    the loop the same way, whether the gate is a plain `blocked` or the
+    `reconcile` gate a worktree merge tripwire raises (ticket 006)."""
+    state.gate = gate
+    state.halt_reason = reason
+    save_state(layout, state)
+    append_event(layout, "halt", reason=reason, gate=gate)
+    return state

@@ -49,12 +49,20 @@ _PLAN_RESPONSE: StructuredPayload = {
 }
 
 
+DEFAULT_STUB_CAPABILITIES: list[str] = ["stub"]
+
+
 class StubAdapter:
+    def __init__(self, capabilities: list[str] | None = None) -> None:
+        self._capabilities = (
+            list(capabilities) if capabilities is not None else list(DEFAULT_STUB_CAPABILITIES)
+        )
+
     def resolve_model(self, tier: TaskTier) -> str:
         return STUB_TIER_MODEL[tier]
 
     def capabilities(self) -> list[str]:
-        return ["stub"]
+        return list(self._capabilities)
 
     def run(
         self,
