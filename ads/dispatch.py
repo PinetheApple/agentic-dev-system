@@ -12,6 +12,14 @@ Two dispatch strategies, chosen by the git floor (`worktree.is_git_repo`):
   run sequentially relative to each other; non-critical tasks run
   concurrently (bounded by `harness.toml`'s `max_parallel`) only if the
   adapter advertises the `parallel` capability.
+
+Ticket 005 Rule 3: there is deliberately no mid-task summarize/compaction
+step here. The Rule-2 scratch skeleton (`ads/resume.py`) plus a fresh, cold
+`adapter.run()` on redispatch already IS the compaction — a task never gets
+its own transcript "summarized in place" mid-flight. Whatever compaction a
+harness performs natively inside one `run()` call is a non-load-bearing
+accelerator ADS never depends on or drives; nothing here builds or calls
+into such a mechanism.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from ads import resume as resume_module
 from ads import worktree
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
@@ -49,6 +58,7 @@ def run(
         return state
 
     design_text = layout.design.read_text(encoding="utf-8")
+    spec_text = layout.spec.read_text(encoding="utf-8") if layout.spec.exists() else ""
 
     if not worktree.is_git_repo(layout.repo):
         # Git floor: no worktree isolation possible (not a git repo, or not
@@ -58,9 +68,9 @@ def run(
             "dispatch running sequential, in-place, without worktree isolation",
             file=sys.stderr,
         )
-        return _dispatch_inplace(layout, cfg, adapter, state, batch, design_text)
+        return _dispatch_inplace(layout, cfg, adapter, state, batch, spec_text, design_text)
 
-    return _dispatch_isolated(layout, cfg, adapter, state, batch, design_text)
+    return _dispatch_isolated(layout, cfg, adapter, state, batch, spec_text, design_text)
 
 
 def _dispatch_inplace(
@@ -69,12 +79,17 @@ def _dispatch_inplace(
     adapter: Adapter,
     state: State,
     batch: list[Task],
+    spec_text: str,
     design_text: str,
 ) -> State:
     critical_blocked = False
     for task in batch:
-        prompt, allowed_tools = _compose_task_prompt(cfg, task, design_text)
+        resume_module.scaffold_scratch(layout, task)
+        prompt, allowed_tools = _compose_task_prompt(cfg, layout, task, spec_text, design_text)
         result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier=task.tier)
+        # TODO(ticket-005-rule-5): a step/tool-call budget ceiling would gate
+        # here — an over-budget run should route to a "handoff" status and a
+        # resumptive re-split instead of falling straight through to "blocked".
         task.status = "done" if _task_succeeded(result) else "blocked"
         critical_blocked = critical_blocked or (task.critical and task.status == "blocked")
 
@@ -95,11 +110,16 @@ def _dispatch_inplace(
 # ---------------------------------------------------------------------------
 
 
-def _compose_task_prompt(cfg: Config, task: Task, design_text: str) -> tuple[str, list[str] | None]:
+def _compose_task_prompt(
+    cfg: Config, layout: RunLayout, task: Task, spec_text: str, design_text: str
+) -> tuple[str, list[str] | None]:
     expert = cfg.experts.get(task.expert)
     expert_body = expert.body if expert else ""
     task_body = cfg.phases["dispatch"].body.replace("{task}", task.body)
-    prompt = compose(cfg.base, expert_body, design_text, task_body)
+    resume_text = resume_module.assemble_resume_context(layout, task) or ""
+    prompt = compose(
+        cfg.base, expert_body, design_text, task_body, spec=spec_text, resume=resume_text
+    )
     allowed_tools = list(expert.tools) if expert and expert.tools else None
     return prompt, allowed_tools
 
@@ -117,6 +137,7 @@ def _dispatch_one_isolated(
     cfg: Config,
     adapter: Adapter,
     task: Task,
+    spec_text: str,
     design_text: str,
     base_sha: str,
     git_lock: threading.Lock,
@@ -128,7 +149,8 @@ def _dispatch_one_isolated(
     cleaned up) and the caller must halt to the `reconcile` gate rather
     than treat this as an ordinary blocked task.
     """
-    prompt, allowed_tools = _compose_task_prompt(cfg, task, design_text)
+    resume_module.scaffold_scratch(layout, task)
+    prompt, allowed_tools = _compose_task_prompt(cfg, layout, task, spec_text, design_text)
 
     with git_lock:
         wt = worktree.create_worktree(layout.repo, base_sha, layout.run_id, task.id)
@@ -145,6 +167,9 @@ def _dispatch_one_isolated(
         if not worktree.remove_worktree(layout.repo, wt):
             print(f"warning: failed to clean up worktree for {task.id}: {wt.path}", file=sys.stderr)
 
+    # TODO(ticket-005-rule-5): a step/tool-call budget ceiling would gate
+    # here — an over-budget run should route to a "handoff" status and a
+    # resumptive re-split instead of falling straight through to "blocked".
     task.status = "done" if task_ok else "blocked"
     write_task(layout, task)
     write_scratch(layout, task, result)
@@ -157,6 +182,7 @@ def _dispatch_isolated(
     adapter: Adapter,
     state: State,
     batch: list[Task],
+    spec_text: str,
     design_text: str,
 ) -> State:
     base_sha = worktree.head_sha(layout.repo)
@@ -167,7 +193,9 @@ def _dispatch_isolated(
     max_workers = max(1, cfg.harness.max_parallel)
 
     def run_one(task: Task) -> tuple[Task, MergeOutcome | None]:
-        return _dispatch_one_isolated(layout, cfg, adapter, task, design_text, base_sha, git_lock)
+        return _dispatch_one_isolated(
+            layout, cfg, adapter, task, spec_text, design_text, base_sha, git_lock
+        )
 
     # Never parallelize critical x critical: critical tasks always run
     # sequentially relative to each other, whatever the adapter can do.

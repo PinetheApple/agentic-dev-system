@@ -29,10 +29,15 @@ def write_task(layout: RunLayout, task: Task) -> None:
 
 
 def write_scratch(layout: RunLayout, task: Task, result: RunResult) -> None:
+    """Append the run's outcome to scratch/<id>.md. Appends rather than
+    overwrites (ticket 005 Rule 2): the file was scaffolded with the
+    Objective/Done/Remaining/Decisions skeleton before run(), and the task
+    may have edited it in place while running — this call must not erase
+    that checkpoint."""
     scratch_path = layout.scratch_dir / f"{task.id}.md"
-    scratch_path.write_text(
-        f"# {task.id}\n\nstatus: {task.status}\n\n{result.text}\n", encoding="utf-8"
-    )
+    footer = f"\n## Run result ({task.status})\n\n{result.text}\n"
+    with scratch_path.open("a", encoding="utf-8") as fh:
+        fh.write(footer)
 
 
 def clear_dir(path: Path) -> None:

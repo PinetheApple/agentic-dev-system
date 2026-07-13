@@ -182,7 +182,9 @@ class TestPromptCompositionIsAdapterAgnostic(unittest.TestCase):
         influence the prompt at all — not just that two calls agree."""
         params = list(inspect.signature(compose).parameters)
 
-        self.assertEqual(params, ["base", "expert_body", "design", "task_body"])
+        # spec/resume (ticket 005) are content params like the rest, never
+        # adapter/harness-derived -> still no adapter seam.
+        self.assertEqual(params, ["base", "expert_body", "design", "task_body", "spec", "resume"])
 
     def test_dispatch_prompt_built_from_config_is_byte_identical_across_adapters(self) -> None:
         """Build the same dispatch prompt the driver would build, once per
