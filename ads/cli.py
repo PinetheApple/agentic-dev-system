@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import cast, get_args
 
-from ads import escalation, sandbox, status
+from ads import escalation, sandbox, status, tui
 from ads._literal import validate_literal
 from ads.adapters.base import (
     ADAPTER_CLAUDE_CODE,
@@ -151,6 +151,18 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(status.render_plain(run_status), end="")
 
 
+def cmd_watch(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    stub_layout = RunLayout(repo=repo, run_id="current")
+    run_id = _resolve_run_id(stub_layout, args.run_id)
+    layout = RunLayout(repo=repo, run_id=run_id)
+    try:
+        tui.run_tui(layout, poll_seconds=args.poll)
+    except tui.TUIUnavailable as exc:
+        print(f"watch needs an interactive terminal ({exc}); showing a snapshot instead:")
+        _print_status(layout)
+
+
 def cmd_escalations(args: argparse.Namespace) -> None:
     repo = Path(args.repo).resolve()
     stub_layout = RunLayout(repo=repo, run_id="current")
@@ -237,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="show run state")
     p_status.add_argument("--json", action="store_true", help="print machine-readable JSON")
     p_status.set_defaults(func=cmd_status)
+
+    p_watch = sub.add_parser("watch", help="live TUI dashboard over run status")
+    p_watch.add_argument(
+        "--poll", type=float, default=1.0, help="poll interval in seconds (default: 1.0)"
+    )
+    p_watch.set_defaults(func=cmd_watch)
 
     p_escalations = sub.add_parser("escalations", help="list open escalation requests")
     p_escalations.set_defaults(func=cmd_escalations)
