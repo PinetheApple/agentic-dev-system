@@ -19,7 +19,7 @@ from ads.tasks import TaskStatus
 
 Phase = Literal["intake", "plan", "review", "dispatch", "validate", "done"]
 ReviewStage = Literal["spec", "design"]
-Gate = Literal["pending", "blocked", "reconcile"]
+Gate = Literal["pending", "blocked", "reconcile", "escalation"]
 ReplanScope = Literal["design"]
 
 PHASES: tuple[Phase, ...] = get_args(Phase)
@@ -40,6 +40,15 @@ class State:
     # the portable budget-ceiling floor (ads/resplit.py's STEP_CEILING).
     # Survives crash since it's part of the atomically-written state.json.
     step_counts: dict[str, int] = field(default_factory=dict[str, int])
+    # Ticket 011 dec 6 + dec 7: the open-set cursor for the escalation gate —
+    # request id -> "pending"|"approved"|"rejected". Bodies (reason/exact
+    # payload) live on disk under `escalations_dir`; this is only the status
+    # the loop reads to decide whether the gate is still open.
+    escalations: dict[str, str] = field(default_factory=dict[str, str])
+    # Exact `cmd` strings a human has approved via a cmd-flagged escalation,
+    # so `escalation.screen_cmd` skips them on re-dispatch instead of
+    # re-flagging and re-halting the same approved command forever.
+    approved_cmds: list[str] = field(default_factory=list[str])
     cursor: str | None = None
     halt_reason: str | None = None
     # None = full (re)plan; "design" = spec.md is frozen-approved, only
@@ -74,6 +83,8 @@ class State:
             tasks=dict(data.get("tasks", {})),
             retry_counts=dict(data.get("retry_counts", {})),
             step_counts=dict(data.get("step_counts", {})),
+            escalations=dict(data.get("escalations", {})),
+            approved_cmds=list(data.get("approved_cmds", [])),
             cursor=data.get("cursor"),
             halt_reason=data.get("halt_reason"),
             replan_scope=cast(

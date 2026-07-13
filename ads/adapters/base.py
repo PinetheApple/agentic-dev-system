@@ -53,6 +53,11 @@ class TaskPayload(_TaskPayloadRequired, total=False):
 # `Adapter` contract is phase-agnostic — so this TypedDict is the union of all
 # fields any phase may populate (`total=False`: each call only sets a subset).
 # Functional syntax is required for the `pass` key (a Python keyword).
+# `op`/`target`/`exact` (ticket 011 dec 6): the structured escalation request
+# an agent emits alongside `status: "needs-escalation"` — the outward op it
+# wants (e.g. "git-push"), what it targets (e.g. "origin/main"), and the
+# exact cmd or unified diff the driver would run/apply on approval. Reason
+# text reuses the existing `summary` field.
 StructuredPayload = TypedDict(
     "StructuredPayload",
     {
@@ -64,6 +69,9 @@ StructuredPayload = TypedDict(
         "pass": bool,
         "evidence": str,
         "cited_paths": list[str],
+        "op": str,
+        "target": str,
+        "exact": str,
     },
     total=False,
 )

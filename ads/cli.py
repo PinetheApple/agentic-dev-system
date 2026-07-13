@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import cast, get_args
 
-from ads import sandbox
+from ads import escalation, sandbox
 from ads._literal import validate_literal
 from ads.adapters.base import (
     ADAPTER_CLAUDE_CODE,
@@ -86,6 +86,7 @@ def _print_status(layout: RunLayout) -> None:
     print(f"halt_reason:  {state.halt_reason}")
     print(f"tasks:        {state.tasks}")
     print(f"retry_counts: {state.retry_counts}")
+    print(f"escalations:  {state.escalations}")
     print(f"updated_at:   {state.updated_at}")
 
 
@@ -155,6 +156,57 @@ def cmd_status(args: argparse.Namespace) -> None:
     _print_status(layout)
 
 
+def cmd_escalations(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    stub_layout = RunLayout(repo=repo, run_id="current")
+    run_id = _resolve_run_id(stub_layout, args.run_id)
+    layout = RunLayout(repo=repo, run_id=run_id)
+    state = load_state(layout)
+    open_ids = escalation.list_open(state)
+    if not open_ids:
+        print("no open escalations")
+        return
+    for request_id in open_ids:
+        request = escalation.load_request(layout, request_id)
+        reason = request.reason.splitlines()[0] if request.reason else ""
+        print(
+            f"{request.id}\ttask={request.task_id}\tkind={request.kind}\t"
+            f"op={request.op}\ttarget={request.target}\treason={reason}"
+        )
+
+
+def cmd_escalate_approve(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    stub_layout = RunLayout(repo=repo, run_id="current")
+    run_id = _resolve_run_id(stub_layout, args.run_id)
+    layout = RunLayout(repo=repo, run_id=run_id)
+    state = load_state(layout)
+    escalation.approve(layout, state, args.request_id)
+    if args.no_continue:
+        _print_status(layout)
+        return
+    cfg = load_config(layout.config)
+    adapter = _adapter_for_run(layout, cfg, _adapter_name_arg(args.adapter))
+    run_until_halt(layout, cfg, adapter)
+    _print_status(layout)
+
+
+def cmd_escalate_reject(args: argparse.Namespace) -> None:
+    repo = Path(args.repo).resolve()
+    stub_layout = RunLayout(repo=repo, run_id="current")
+    run_id = _resolve_run_id(stub_layout, args.run_id)
+    layout = RunLayout(repo=repo, run_id=run_id)
+    state = load_state(layout)
+    escalation.reject(layout, state, args.request_id, args.reason)
+    if args.no_continue:
+        _print_status(layout)
+        return
+    cfg = load_config(layout.config)
+    adapter = _adapter_for_run(layout, cfg, _adapter_name_arg(args.adapter))
+    run_until_halt(layout, cfg, adapter)
+    _print_status(layout)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="driver")
     parser.add_argument("--repo", default=".", help="repo root (default: cwd)")
@@ -189,6 +241,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="show run state")
     p_status.set_defaults(func=cmd_status)
+
+    p_escalations = sub.add_parser("escalations", help="list open escalation requests")
+    p_escalations.set_defaults(func=cmd_escalations)
+
+    p_esc_approve = sub.add_parser("escalate-approve", help="approve an escalation request")
+    p_esc_approve.add_argument("request_id", help="escalation request id (e.g. esc-01-a-1)")
+    p_esc_approve.add_argument(
+        "--no-continue", action="store_true", help="don't auto-advance after approving"
+    )
+    p_esc_approve.set_defaults(func=cmd_escalate_approve)
+
+    p_esc_reject = sub.add_parser("escalate-reject", help="reject an escalation request")
+    p_esc_reject.add_argument("request_id", help="escalation request id (e.g. esc-01-a-1)")
+    p_esc_reject.add_argument("reason", help="why it was rejected")
+    p_esc_reject.add_argument(
+        "--no-continue", action="store_true", help="don't auto-advance after rejecting"
+    )
+    p_esc_reject.set_defaults(func=cmd_escalate_reject)
 
     return parser
 

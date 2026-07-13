@@ -15,7 +15,7 @@ from ads._literal import validate_literal
 
 FRONTMATTER_DELIM = "---"
 
-TaskStatus = Literal["pending", "active", "done", "split", "blocked"]
+TaskStatus = Literal["pending", "active", "done", "split", "blocked", "needs-escalation"]
 TaskTier = Literal["fast", "standard", "deep"]
 ExitCriterionCheck = Literal["cmd", "judgment"]
 

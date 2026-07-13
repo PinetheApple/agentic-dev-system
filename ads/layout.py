@@ -54,6 +54,10 @@ class RunLayout:
         return self.root / "scratch"
 
     @property
+    def escalations_dir(self) -> Path:
+        return self.root / "escalations"
+
+    @property
     def events(self) -> Path:
         return self.root / "events.jsonl"
 
@@ -65,6 +69,7 @@ class RunLayout:
         """Create the run directory tree. Idempotent."""
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        self.escalations_dir.mkdir(parents=True, exist_ok=True)
 
     def link_current(self) -> None:
         """Point `runs/current` -> this run (best-effort symlink)."""

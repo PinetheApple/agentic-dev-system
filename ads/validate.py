@@ -137,14 +137,10 @@ def _run_cmd_criterion(
     env = sandbox.resolve_env(policy, os.environ)
     argv, use_shell = sandbox.wrap_shell(criterion.value, cwd, policy, env)
 
-    # dec 7 soft screen: advisory-only, lands in the report/feedback text so
-    # a human reviewer sees it — never blocks execution. Routing a flagged
-    # command to approval is the deferred dec-6 `needs-escalation` machinery.
-    verdict = sandbox.classify_cmd(criterion.value)
-    flag_note = ""
-    if verdict.flagged:
-        flag_note = f"\n[sandbox classifier] flagged: {', '.join(verdict.reasons)}"
-
+    # dec 7 routing now lives upstream, before this function is ever called:
+    # ads/dispatch.py's `_gate_and_route` screens every `cmd` criterion via
+    # `ads/escalation.py`'s `screen_cmd` and routes a flagged, not-yet-
+    # approved command to human escalation instead of reaching here at all.
     try:
         proc = subprocess.run(
             argv,
@@ -155,12 +151,9 @@ def _run_cmd_criterion(
             timeout=CMD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        detail = f"timed out after {CMD_TIMEOUT_SECONDS}s: {criterion.value!r}{flag_note}"
+        detail = f"timed out after {CMD_TIMEOUT_SECONDS}s: {criterion.value!r}"
         return CriterionResult(check="cmd", value=criterion.value, passed=False, detail=detail)
-    detail = (
-        f"exit={proc.returncode}\n--- stdout ---\n{proc.stdout}--- stderr ---\n{proc.stderr}"
-        f"{flag_note}"
-    )
+    detail = f"exit={proc.returncode}\n--- stdout ---\n{proc.stdout}--- stderr ---\n{proc.stderr}"
     return CriterionResult(
         check="cmd", value=criterion.value, passed=proc.returncode == 0, detail=detail
     )

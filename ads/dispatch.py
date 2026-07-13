@@ -40,7 +40,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from ads import reconcile, resplit, sandbox, validate, worktree
+from ads import escalation, reconcile, resplit, sandbox, validate, worktree
 from ads import resume as resume_module
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
@@ -121,6 +121,8 @@ def _dispatch_inplace(
                 )
         except resplit.ResplitDepthExceeded as exc:
             return halt(layout, state, str(exc))
+        except escalation.EscalationRaised as exc:
+            return halt(layout, state, str(exc), gate="escalation")
         critical_blocked = critical_blocked or (task.critical and task.status == "blocked")
 
     if critical_blocked:
@@ -167,8 +169,30 @@ def _apply_run_result(layout: RunLayout, state: State, task: Task, result: RunRe
     is neither still becomes `blocked` as before.
 
     Raises `resplit.ResplitDepthExceeded` when the task's re-split lineage
-    is already at the cap — the caller halts to a human.
+    is already at the cap — the caller halts to a human. Raises
+    `escalation.EscalationRaised` (ticket 011 dec 6) when the run's
+    structured payload asks for `status: "needs-escalation"` — an outward
+    op the agent wants but can never self-grant; the caller halts to the
+    `escalation` gate instead of treating this as a success/blocked/handoff.
     """
+    if result.structured is not None and result.structured.get("status") == "needs-escalation":
+        payload = result.structured
+        request = escalation.open_request(
+            layout,
+            state,
+            task_id=task.id,
+            kind="agent-request",
+            op=str(payload.get("op", "") or ""),
+            target=str(payload.get("target", "") or ""),
+            reason=str(payload.get("summary", "") or ""),
+            exact=str(payload.get("exact", "") or ""),
+        )
+        task.status = "needs-escalation"
+        write_task(layout, task)
+        write_scratch(layout, task, result)
+        state.tasks[task.id] = "needs-escalation"
+        raise escalation.EscalationRaised(request.id)
+
     if _task_succeeded(result):
         task.status = "done"
     elif resplit.is_handoff(result) or resplit.breached_ceiling(state.step_counts.get(task.id, 0)):
@@ -208,8 +232,35 @@ def _gate_and_route(
     blocked/handoff loop). Returns `False`; the caller must NOT merge.
 
     May raise `resplit.ResplitDepthExceeded` — the caller lets it propagate
-    to the driver's existing halt-to-human handling.
+    to the driver's existing halt-to-human handling. May also raise
+    `escalation.EscalationRaised` (ticket 011 dec 7): before evaluating,
+    every `cmd` exit-criterion is screened via `escalation.screen_cmd` —
+    a flagged, not-yet-approved command is never run; it's routed to human
+    escalation instead, through the same exception path a `resplit` cap
+    breach uses, and this function never reaches `validate.evaluate_task_at`
+    for it.
     """
+    for criterion in task.exit_criteria:
+        if criterion.check != "cmd":
+            continue
+        flagged, reasons = escalation.screen_cmd(criterion.value, state.approved_cmds)
+        if not flagged:
+            continue
+        request = escalation.open_request(
+            layout,
+            state,
+            task_id=task.id,
+            kind="cmd-flagged",
+            op="run-cmd",
+            target=criterion.value,
+            reason=", ".join(reasons),
+            exact=criterion.value,
+        )
+        task.status = "needs-escalation"
+        write_task(layout, task)
+        state.tasks[task.id] = "needs-escalation"
+        raise escalation.EscalationRaised(request.id)
+
     policy = sandbox.policy_from_harness(cfg.harness)
     tv = validate.evaluate_task_at(
         layout, cfg, adapter, task, cwd=cwd, diff_text=diff_text, policy=policy
@@ -333,6 +384,7 @@ def _dispatch_isolated(
         )
 
     resplit_halt_reason: str | None = None
+    escalation_request_id: str | None = None
 
     # Never parallelize critical x critical: critical tasks always run
     # sequentially relative to each other, whatever the adapter can do.
@@ -342,6 +394,8 @@ def _dispatch_isolated(
             updated, outcome = run_one(task)
         except resplit.ResplitDepthExceeded as exc:
             return halt(layout, state, str(exc))
+        except escalation.EscalationRaised as exc:
+            return halt(layout, state, str(exc), gate="escalation")
         state.tasks[updated.id] = updated.status
         if outcome is not None:
             return _halt_reconcile(layout, state, updated, outcome)
@@ -357,6 +411,9 @@ def _dispatch_isolated(
                 except resplit.ResplitDepthExceeded as exc:
                     resplit_halt_reason = resplit_halt_reason or str(exc)
                     continue
+                except escalation.EscalationRaised as exc:
+                    escalation_request_id = escalation_request_id or exc.request_id
+                    continue
                 state.tasks[updated.id] = updated.status
                 if outcome is not None and reconcile is None:
                     reconcile = (updated, outcome)
@@ -367,6 +424,9 @@ def _dispatch_isolated(
             except resplit.ResplitDepthExceeded as exc:
                 resplit_halt_reason = resplit_halt_reason or str(exc)
                 continue
+            except escalation.EscalationRaised as exc:
+                escalation_request_id = escalation_request_id or exc.request_id
+                continue
             state.tasks[updated.id] = updated.status
             if outcome is not None:
                 reconcile = (updated, outcome)
@@ -374,6 +434,14 @@ def _dispatch_isolated(
 
     if reconcile is not None:
         return _halt_reconcile(layout, state, reconcile[0], reconcile[1])
+
+    if escalation_request_id is not None:
+        return halt(
+            layout,
+            state,
+            f"escalation requested: {escalation_request_id}",
+            gate="escalation",
+        )
 
     if resplit_halt_reason is not None:
         return halt(layout, state, resplit_halt_reason)

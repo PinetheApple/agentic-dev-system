@@ -11,11 +11,13 @@ regardless of which harness is driving (`ads/adapters/claude_code.py`,
 `ads/adapters/opencode.py`) or which gate is executing (`ads/validate.py`'s
 `cmd` criterion) — selected by policy/capability, never an `if claude-code`.
 
-Deliberately OUT of scope this slice (see the ticket): the `needs-escalation`
-driver approval state machine (dec 6) and driver-brokered deps/WebFetch
-(dec 3). `classify_cmd` below is advisory-only — it never blocks execution;
-routing a flagged command to human escalation is exactly that deferred dec-6
-machinery.
+`classify_cmd` below is pure and this module never blocks anything itself —
+`ads/escalation.py`'s `screen_cmd` is the live choke point that decides
+whether a flagged, not-yet-approved command gets routed to human escalation
+(dec 6/dec 7) instead of reaching `ads/validate.py`'s `cmd` gate at all.
+Deliberately OUT of scope this slice (see the ticket): driver-brokered
+deps/WebFetch (dec 3), and the outward-op executor itself (dec 6) — see
+`ads/escalation.py`'s `perform_outward_op` seam.
 """
 
 from __future__ import annotations
@@ -304,11 +306,11 @@ def policy_from_harness(harness: HarnessConfig, *, home: Path | None = None) -> 
 
 
 # ---------------------------------------------------------------------------
-# cmd classifier (dec 7 soft screen) — pure, advisory-only.
-#
-# This never blocks execution; the bwrap floor above is the real boundary.
-# Routing a flagged command to human approval is the deferred dec-6
-# `needs-escalation` state machine — out of scope this slice.
+# cmd classifier (dec 7 soft screen) — pure. This module itself never blocks
+# execution; the bwrap floor above is the real containment boundary.
+# `ads/escalation.py`'s `screen_cmd` is what turns a flagged verdict into an
+# actual block-and-route-to-a-human decision (the dec-6 `needs-escalation`
+# state machine).
 # ---------------------------------------------------------------------------
 
 _RM_RF_RE = re.compile(r"\brm\s+(?:-\S+\s+)*-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(\S+)")
