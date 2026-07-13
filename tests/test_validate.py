@@ -21,7 +21,7 @@ from ads.config import Config, HarnessConfig, PromptDoc
 from ads.driver import MAX_RETRIES, _run_validate  # pyright: ignore[reportPrivateUsage]
 from ads.layout import RunLayout
 from ads.state import State
-from ads.task_io import write_task
+from ads.task_io import load_tasks, write_task
 from ads.tasks import ExitCriterion, Task, TaskTier
 
 VALIDATE_JUDGMENT_BODY = "PHASE:validate-judgment\n\n{criterion}\n\n{diff}\n"
@@ -265,7 +265,7 @@ class TestIntegrationCritic(ValidateTestCase):
         feedback = (self.layout.scratch_dir / "01-ok.md").read_text(encoding="utf-8")
         self.assertIn("Integration validation feedback", feedback)
 
-    def test_failing_verdict_with_no_attributable_task_halts(self) -> None:
+    def test_failing_verdict_with_no_attributable_task_creates_missing_work_task(self) -> None:
         task = _task("01-ok", [ExitCriterion(check="cmd", value="true")], owns=["a.py"])
         state = self._write(task)
         adapter = ScriptedAdapter(
@@ -278,10 +278,26 @@ class TestIntegrationCritic(ValidateTestCase):
 
         result = _run_validate(self.layout, self.cfg, adapter, state)
 
+        self.assertIsNone(result.gate)
+        self.assertEqual(result.phase, "dispatch")
+        self.assertEqual(result.tasks["01-ok"], "done")  # not touched: nothing to retry
+        self.assertEqual(result.tasks["gap-1"], "pending")  # new task covers the gap
+        gap_task = next(t for t in load_tasks(self.layout) if t.id == "gap-1")
+        self.assertEqual(gap_task.owns, ["nowhere.py"])
+        self.assertIsNone(gap_task.parent)
+
+    def test_failing_verdict_with_no_citations_at_all_halts(self) -> None:
+        task = _task("01-ok", [ExitCriterion(check="cmd", value="true")], owns=["a.py"])
+        state = self._write(task)
+        adapter = ScriptedAdapter(
+            integration_payload={"pass": False, "evidence": "vague failure", "cited_paths": []}
+        )
+
+        result = _run_validate(self.layout, self.cfg, adapter, state)
+
         self.assertEqual(result.gate, "blocked")
         assert result.halt_reason is not None
-        self.assertIn("resumptive re-split", result.halt_reason)
-        self.assertIn("ticket-005-rule-5", result.halt_reason)
+        self.assertIn("no cited paths", result.halt_reason)
         self.assertEqual(result.tasks["01-ok"], "done")  # not touched: nothing to retry
 
 

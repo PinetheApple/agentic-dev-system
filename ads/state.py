@@ -36,6 +36,10 @@ class State:
     gate: Gate | None = None
     tasks: dict[str, TaskStatus] = field(default_factory=dict[str, TaskStatus])
     retry_counts: dict[str, int] = field(default_factory=dict[str, int])
+    # Ticket 005 Rule 5: machine-owned dispatch-attempt counter per task id,
+    # the portable budget-ceiling floor (ads/resplit.py's STEP_CEILING).
+    # Survives crash since it's part of the atomically-written state.json.
+    step_counts: dict[str, int] = field(default_factory=dict[str, int])
     cursor: str | None = None
     halt_reason: str | None = None
     # None = full (re)plan; "design" = spec.md is frozen-approved, only
@@ -69,6 +73,7 @@ class State:
             else None,
             tasks=dict(data.get("tasks", {})),
             retry_counts=dict(data.get("retry_counts", {})),
+            step_counts=dict(data.get("step_counts", {})),
             cursor=data.get("cursor"),
             halt_reason=data.get("halt_reason"),
             replan_scope=cast(

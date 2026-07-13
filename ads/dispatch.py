@@ -35,8 +35,8 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from ads import resplit, worktree
 from ads import resume as resume_module
-from ads import worktree
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
 from ads.layout import RunLayout
@@ -93,16 +93,14 @@ def _dispatch_inplace(
     for task in batch:
         resume_module.scaffold_scratch(layout, task)
         prompt, allowed_tools = _compose_task_prompt(cfg, layout, task, spec_text, design_text)
+        state.step_counts[task.id] = state.step_counts.get(task.id, 0) + 1
         result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier=task.tier)
-        # TODO(ticket-005-rule-5): a step/tool-call budget ceiling would gate
-        # here — an over-budget run should route to a "handoff" status and a
-        # resumptive re-split instead of falling straight through to "blocked".
-        task.status = "done" if _task_succeeded(result) else "blocked"
-        critical_blocked = critical_blocked or (task.critical and task.status == "blocked")
 
-        write_task(layout, task)
-        write_scratch(layout, task, result)
-        state.tasks[task.id] = task.status
+        try:
+            _apply_run_result(layout, state, task, result)
+        except resplit.ResplitDepthExceeded as exc:
+            return halt(layout, state, str(exc))
+        critical_blocked = critical_blocked or (task.critical and task.status == "blocked")
 
     if critical_blocked:
         return halt(layout, state, "a critical task blocked during dispatch")
@@ -139,10 +137,35 @@ def _task_succeeded(result: RunResult) -> bool:
     )
 
 
+def _apply_run_result(layout: RunLayout, state: State, task: Task, result: RunResult) -> None:
+    """Resolve one dispatch attempt (ticket 005 Rule 5 / 003): sets `task`'s
+    status in place, writes its task + scratch files, and folds the outcome
+    into `state.tasks`. A budget-ceiling breach or a `handoff` result routes
+    through `resplit.perform` (parent -> `split`, residual child created and
+    written) instead of falling to a bare `blocked`; a genuine failure that
+    is neither still becomes `blocked` as before.
+
+    Raises `resplit.ResplitDepthExceeded` when the task's re-split lineage
+    is already at the cap — the caller halts to a human.
+    """
+    if _task_succeeded(result):
+        task.status = "done"
+    elif resplit.is_handoff(result) or resplit.breached_ceiling(state.step_counts.get(task.id, 0)):
+        child = resplit.perform(layout, task)  # writes both task files, seeds child scratch
+        state.tasks[child.id] = child.status
+    else:
+        task.status = "blocked"
+
+    write_task(layout, task)
+    write_scratch(layout, task, result)
+    state.tasks[task.id] = task.status
+
+
 def _dispatch_one_isolated(
     layout: RunLayout,
     cfg: Config,
     adapter: Adapter,
+    state: State,
     task: Task,
     spec_text: str,
     design_text: str,
@@ -155,12 +178,17 @@ def _dispatch_one_isolated(
     outcome means a tripwire fired: the worktree is left on disk (not
     cleaned up) and the caller must halt to the `reconcile` gate rather
     than treat this as an ordinary blocked task.
+
+    May raise `resplit.ResplitDepthExceeded` (from `_apply_run_result`) when
+    a budget/handoff re-split's lineage is already at the cap; the caller
+    halts to a human.
     """
     resume_module.scaffold_scratch(layout, task)
     prompt, allowed_tools = _compose_task_prompt(cfg, layout, task, spec_text, design_text)
 
     with git_lock:
         wt = worktree.create_worktree(layout.repo, base_sha, layout.run_id, task.id)
+        state.step_counts[task.id] = state.step_counts.get(task.id, 0) + 1
 
     result = adapter.run(prompt, cwd=wt.path, allowed_tools=allowed_tools, tier=task.tier)
     task_ok = _task_succeeded(result)
@@ -173,13 +201,8 @@ def _dispatch_one_isolated(
             return task, outcome  # worktree intentionally left intact
         if not worktree.remove_worktree(layout.repo, wt):
             print(f"warning: failed to clean up worktree for {task.id}: {wt.path}", file=sys.stderr)
+        _apply_run_result(layout, state, task, result)
 
-    # TODO(ticket-005-rule-5): a step/tool-call budget ceiling would gate
-    # here — an over-budget run should route to a "handoff" status and a
-    # resumptive re-split instead of falling straight through to "blocked".
-    task.status = "done" if task_ok else "blocked"
-    write_task(layout, task)
-    write_scratch(layout, task, result)
     return task, None
 
 
@@ -201,14 +224,19 @@ def _dispatch_isolated(
 
     def run_one(task: Task) -> tuple[Task, MergeOutcome | None]:
         return _dispatch_one_isolated(
-            layout, cfg, adapter, task, spec_text, design_text, base_sha, git_lock
+            layout, cfg, adapter, state, task, spec_text, design_text, base_sha, git_lock
         )
+
+    resplit_halt_reason: str | None = None
 
     # Never parallelize critical x critical: critical tasks always run
     # sequentially relative to each other, whatever the adapter can do.
     critical_blocked = False
     for task in critical_tasks:
-        updated, outcome = run_one(task)
+        try:
+            updated, outcome = run_one(task)
+        except resplit.ResplitDepthExceeded as exc:
+            return halt(layout, state, str(exc))
         state.tasks[updated.id] = updated.status
         if outcome is not None:
             return _halt_reconcile(layout, state, updated, outcome)
@@ -219,13 +247,21 @@ def _dispatch_isolated(
         with ThreadPoolExecutor(max_workers=min(max_workers, len(noncritical_tasks))) as pool:
             futures = [pool.submit(run_one, task) for task in noncritical_tasks]
             for future in as_completed(futures):
-                updated, outcome = future.result()
+                try:
+                    updated, outcome = future.result()
+                except resplit.ResplitDepthExceeded as exc:
+                    resplit_halt_reason = resplit_halt_reason or str(exc)
+                    continue
                 state.tasks[updated.id] = updated.status
                 if outcome is not None and reconcile is None:
                     reconcile = (updated, outcome)
     else:
         for task in noncritical_tasks:
-            updated, outcome = run_one(task)
+            try:
+                updated, outcome = run_one(task)
+            except resplit.ResplitDepthExceeded as exc:
+                resplit_halt_reason = resplit_halt_reason or str(exc)
+                continue
             state.tasks[updated.id] = updated.status
             if outcome is not None:
                 reconcile = (updated, outcome)
@@ -233,6 +269,9 @@ def _dispatch_isolated(
 
     if reconcile is not None:
         return _halt_reconcile(layout, state, reconcile[0], reconcile[1])
+
+    if resplit_halt_reason is not None:
+        return halt(layout, state, resplit_halt_reason)
 
     if critical_blocked:
         return halt(layout, state, "a critical task blocked during dispatch")

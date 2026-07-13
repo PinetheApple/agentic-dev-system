@@ -6,7 +6,7 @@ what to do next; events.jsonl is write-only audit.
 
 from __future__ import annotations
 
-from ads import dispatch, validate
+from ads import dispatch, resplit, validate
 from ads.adapters.base import Adapter, TaskPayload
 from ads.config import Config
 from ads.layout import RunLayout
@@ -20,6 +20,7 @@ MAX_RETRIES = 2
 REVIEW_TO_PLAN = "review_to_plan"
 VALIDATE_TO_DISPATCH = "validate_to_dispatch"
 VALIDATE_INTEGRATION = "validate_integration"
+MISSING_WORK = "missing_work"
 
 
 class DriverError(RuntimeError):
@@ -230,17 +231,7 @@ def _run_validate(layout: RunLayout, cfg: Config, adapter: Adapter, state: State
     if not integration.passed:
         attributed = validate.attribute_paths(all_tasks, integration.cited_paths)
         if not attributed:
-            # TODO(ticket-005-rule-5): an integration failure with no task
-            # owning the cited gap (or no citations at all) is "missing
-            # work" — it needs 003's resumptive re-split, which doesn't
-            # exist yet. Halt to a human instead of guessing which task to
-            # retry.
-            return _halt(
-                layout,
-                state,
-                "integration critic failed with no attributable task "
-                f"(needs resumptive re-split, TODO ticket-005-rule-5): {integration.evidence}",
-            )
+            return _handle_missing_work(layout, state, all_tasks, integration)
         for task_id in attributed:
             validate.write_integration_feedback(layout, task_id, integration)
         return _retry_validate(
@@ -256,6 +247,48 @@ def _run_validate(layout: RunLayout, cfg: Config, adapter: Adapter, state: State
     state.gate = None
     save_state(layout, state)
     append_event(layout, "validate_pass")
+    return state
+
+
+def _handle_missing_work(
+    layout: RunLayout, state: State, all_tasks: list[Task], integration: validate.IntegrationVerdict
+) -> State:
+    """Ticket 005 Rule 5 / 003: the integration critic cited a gap no task's
+    `owns` covers. Rather than halting outright, spawn a new parentless task
+    over the cited paths and loop back to dispatch — matching the resplit
+    module's "residual work, never a re-gate" shape. Bounded by the same
+    `MAX_RETRIES` ceiling as every other validate retry edge; halts to a
+    human on exhaustion or when the gap is truly unattributable (no cited
+    paths at all)."""
+    new_task = resplit.missing_work_task(all_tasks, integration.evidence, integration.cited_paths)
+    if new_task is None:
+        return _halt(
+            layout,
+            state,
+            "integration critic failed with no attributable task and no cited "
+            f"paths to build a new one from: {integration.evidence}",
+        )
+
+    count = state.retry_counts.get(MISSING_WORK, 0) + 1
+    if count > MAX_RETRIES:
+        return _halt(layout, state, f"{MISSING_WORK} retries exhausted: {integration.evidence}")
+    state.retry_counts[MISSING_WORK] = count
+
+    write_task(layout, new_task)
+    validate.write_integration_feedback(layout, new_task.id, integration)
+    all_tasks.append(new_task)
+    check_acyclic(all_tasks)
+
+    state.tasks[new_task.id] = new_task.status
+    state.phase = "dispatch"
+    state.gate = None
+    save_state(layout, state)
+    append_event(
+        layout,
+        "validate_missing_work",
+        new_task_id=new_task.id,
+        cited_paths=integration.cited_paths,
+    )
     return state
 
 
