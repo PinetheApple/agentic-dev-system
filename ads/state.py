@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, cast, get_args
 
 from ads._literal import validate_literal
-from ads.adapters.base import AdapterName
+from ads.adapters.base import ADAPTER_CLAUDE_CODE, AdapterName
 from ads.layout import RunLayout
 from ads.tasks import TaskStatus
 
@@ -26,7 +26,7 @@ PHASES: tuple[Phase, ...] = get_args(Phase)
 REVIEW_STAGES: tuple[ReviewStage, ...] = get_args(ReviewStage)
 GATES: tuple[Gate, ...] = get_args(Gate)
 
-DEFAULT_ADAPTER: AdapterName = "claude-code"
+DEFAULT_ADAPTER: AdapterName = ADAPTER_CLAUDE_CODE
 
 
 @dataclass

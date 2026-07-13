@@ -8,11 +8,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict
+from typing import Literal, Protocol, TypedDict, get_args
 
 from ads.tasks import ExitCriterionCheck, TaskStatus, TaskTier
 
-AdapterName = Literal["claude-code", "stub"]
+AdapterName = Literal["claude-code", "stub", "opencode"]
+
+ADAPTER_CLAUDE_CODE: AdapterName = "claude-code"
+ADAPTER_STUB: AdapterName = "stub"
+ADAPTER_OPENCODE: AdapterName = "opencode"
+ADAPTER_NAMES: tuple[AdapterName, ...] = get_args(AdapterName)
 
 ExitStatus = Literal["ok", "error"]
 

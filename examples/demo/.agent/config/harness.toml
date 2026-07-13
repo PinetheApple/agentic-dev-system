@@ -9,4 +9,4 @@ deep = "claude-opus-4-8"
 cmd = ["claude", "-p"]
 
 [capabilities]
-flags = ["tools", "streaming", "json_output"]
+flags = ["tools", "allowedtools-cli", "streaming", "json_output"]

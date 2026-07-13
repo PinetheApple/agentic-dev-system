@@ -10,18 +10,16 @@ name.
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 from pathlib import Path
 from typing import cast
 
+from ads.adapters._json_envelope import parse_phase_payload
 from ads.adapters.base import RunResult, StructuredPayload
 from ads.config import HarnessConfig
 from ads.tasks import TaskTier
 
 DEFAULT_TIMEOUT_SECONDS = 600
-
-_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
 
 
 def _extract_result_envelope(raw: object) -> dict[str, object] | None:
@@ -37,24 +35,6 @@ def _extract_result_envelope(raw: object) -> dict[str, object] | None:
             if isinstance(item, dict) and cast(dict[str, object], item).get("type") == "result":
                 return cast(dict[str, object], item)
         return None
-    return None
-
-
-def _strip_json_fence(text: str) -> str:
-    match = _JSON_FENCE_RE.match(text.strip())
-    return match.group(1) if match else text
-
-
-def _parse_phase_payload(text: str) -> StructuredPayload | None:
-    """The model is instructed to answer with a bare JSON object, but may
-    still wrap it in markdown code fences — try both."""
-    for candidate in (text, _strip_json_fence(text)):
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return cast(StructuredPayload, parsed)
     return None
 
 
@@ -76,7 +56,7 @@ def parse_claude_stdout(stdout: str) -> tuple[str, StructuredPayload | None]:
         return stdout, None
 
     text = cast(str, envelope.get("result", stdout))
-    return text, _parse_phase_payload(text)
+    return text, parse_phase_payload(text)
 
 
 class ClaudeCodeAdapter:

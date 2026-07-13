@@ -9,8 +9,16 @@ from pathlib import Path
 from typing import cast, get_args
 
 from ads._literal import validate_literal
-from ads.adapters.base import Adapter, AdapterName
+from ads.adapters.base import (
+    ADAPTER_CLAUDE_CODE,
+    ADAPTER_NAMES,
+    ADAPTER_OPENCODE,
+    ADAPTER_STUB,
+    Adapter,
+    AdapterName,
+)
 from ads.adapters.claude_code import ClaudeCodeAdapter
+from ads.adapters.opencode import OpenCodeAdapter
 from ads.adapters.stub import StubAdapter
 from ads.config import Config, load_config
 from ads.driver import approve as driver_approve
@@ -30,8 +38,10 @@ def _adapter_name_arg(raw: str | None) -> AdapterName | None:
 
 
 def _build_adapter(name: AdapterName, cfg: Config) -> Adapter:
-    if name == "stub":
+    if name == ADAPTER_STUB:
         return StubAdapter()
+    if name == ADAPTER_OPENCODE:
+        return OpenCodeAdapter(cfg.harness)
     return ClaudeCodeAdapter(cfg.harness)
 
 
@@ -82,7 +92,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     run_id = args.run_id or time.strftime("run-%Y%m%d-%H%M%S")
     layout = RunLayout(repo=repo, run_id=run_id)
     cfg = load_config(layout.config)
-    adapter_name = _adapter_name_arg(args.adapter) or "claude-code"
+    adapter_name = _adapter_name_arg(args.adapter) or ADAPTER_CLAUDE_CODE
     adapter = _build_adapter(adapter_name, cfg)
 
     start_run(layout, args.task)
@@ -150,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adapter",
         default=None,
-        choices=("claude-code", "stub"),
+        choices=ADAPTER_NAMES,
         help="harness adapter; set at start, persisted per-run",
     )
     sub = parser.add_subparsers(dest="command", required=True)

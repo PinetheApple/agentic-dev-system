@@ -1,0 +1,15 @@
+# Reference harness config for the `opencode` adapter (ticket 002 proof).
+# Same experts/phases/base as harness.toml — only this file differs.
+# To target OpenCode instead of Claude Code: copy this file over harness.toml
+# (`cp harness.opencode.toml harness.toml`) and pass --adapter opencode.
+
+[tier_model]
+fast = "anthropic/claude-haiku-4-5"
+standard = "anthropic/claude-sonnet-4-5"
+deep = "anthropic/claude-opus-4-5"
+
+[run]
+cmd = ["opencode", "run"]
+
+[capabilities]
+flags = ["tools", "streaming", "json_output"]

@@ -17,7 +17,9 @@ reasoning (Claude Code today; any harness that implements `run()` tomorrow).
   for a runnable sample.
 - `ads/prompt.py` — composes `base + expert + design + task` in memory.
 - `ads/adapters/` — `base.py` (Protocol), `claude_code.py` (shells out to the
-  `claude` CLI), `stub.py` (canned responses for token-free testing).
+  `claude` CLI), `opencode.py` (shells out to the `opencode` CLI), `stub.py`
+  (canned responses for token-free testing), `_json_envelope.py` (shared
+  fence-stripping/phase-JSON parsing both real adapters reuse).
 - `ads/driver.py` — the phase state machine.
 - `ads/cli.py` — `driver start|resume|approve|reject|status`.
 
@@ -75,6 +77,28 @@ Claude-Code `harness.toml`) that makes the loop runnable end to end. The
 experts (`plan`, `python-expert`, `critic`) are illustrative stubs — a real
 target repo ships its own roster (and reuses installed harness skills/agents
 before authoring new experts).
+
+### Swapping harnesses
+
+`base.md`, `experts/*.md`, `phases/*.md` and `tasks/` are harness-agnostic —
+`harness.toml` is the **only** file that names a provider, model, or run
+command. `examples/demo/.agent/config/harness.opencode.toml` is a reference
+OpenCode target with the identical shape (same `[tier_model]`/`[run]`/
+`[capabilities]` keys, OpenCode's `provider/model` ids, `opencode run` as the
+command). To retarget the demo at OpenCode:
+
+```bash
+cp examples/demo/.agent/config/harness.opencode.toml examples/demo/.agent/config/harness.toml
+driver --repo examples/demo --adapter opencode start "Add a health-check endpoint."
+```
+
+Nothing else in `.agent/config/` changes. `harness.toml`'s `[capabilities]`
+flags are also where a harness gap becomes visible: the Claude Code target
+declares `allowedtools-cli` (it has a real `--allowedTools` flag); the
+OpenCode target omits it, because OpenCode has no per-call tool-allowlist
+flag — see `ads/adapters/opencode.py` for how `run()` handles that gap
+honestly (falls back to `--auto` rather than faking a flag that doesn't
+exist).
 
 ## Tests
 
