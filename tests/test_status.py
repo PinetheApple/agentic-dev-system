@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -213,6 +214,69 @@ class TestStatusReadModel(unittest.TestCase):
         empty_layout = RunLayout(repo=self.repo, run_id="does-not-exist")
         with self.assertRaises(StatusUnavailable):
             read_status(empty_layout)
+
+    def test_current_activity_surfaces_elapsed_and_tail_when_active(self) -> None:
+        started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
+        save_state(
+            self.layout,
+            State(
+                phase="dispatch",
+                current_activity={
+                    "label": "01-a",
+                    "kind": "dispatch",
+                    "model": "claude-sonnet-5",
+                    "started_at": started_at,
+                },
+            ),
+        )
+        activity_log = self.layout.activity_dir / "01-a.log"
+        activity_log.parent.mkdir(parents=True, exist_ok=True)
+        activity_log.write_text("line 1\nline 2\nline 3\n", encoding="utf-8")
+
+        result = read_status(self.layout)
+
+        self.assertIsNotNone(result.current_activity)
+        assert result.current_activity is not None
+        self.assertEqual(result.current_activity["label"], "01-a")
+        assert result.activity_elapsed_seconds is not None
+        self.assertGreaterEqual(result.activity_elapsed_seconds, 0)
+        self.assertEqual(result.activity_tail, ("line 1", "line 2", "line 3"))
+
+    def test_current_activity_idle_when_state_has_none(self) -> None:
+        save_state(self.layout, State(phase="dispatch"))
+
+        result = read_status(self.layout)
+
+        self.assertIsNone(result.current_activity)
+        self.assertIsNone(result.activity_elapsed_seconds)
+        self.assertEqual(result.activity_tail, ())
+
+    def test_render_plain_shows_now_line_when_active(self) -> None:
+        save_state(
+            self.layout,
+            State(
+                phase="dispatch",
+                current_activity={
+                    "label": "01-a",
+                    "kind": "dispatch",
+                    "model": "claude-sonnet-5",
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+            ),
+        )
+
+        text = render_plain(read_status(self.layout))
+
+        self.assertIn("NOW:", text)
+        self.assertIn("01-a", text)
+        self.assertIn("claude-sonnet-5", text)
+
+    def test_render_plain_shows_idle_marker_when_no_run_active(self) -> None:
+        save_state(self.layout, State(phase="dispatch"))
+
+        text = render_plain(read_status(self.layout))
+
+        self.assertIn("idle", text)
 
     def test_defensive_read_without_attached_or_escalations_fields(self) -> None:
         """A state.json written before the later control slice adds

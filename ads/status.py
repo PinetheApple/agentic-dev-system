@@ -20,8 +20,10 @@ rewrite.
 
 from __future__ import annotations
 
+import calendar
 import dataclasses
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ from ads.state import State, load_state
 from ads.tasks import Task
 
 DEFAULT_EVENT_TAIL = 20
+DEFAULT_ACTIVITY_TAIL = 12
 OBJECTIVE_HEADING = "## Objective"
 REMAINING_HEADING = "## Remaining"
 
@@ -75,6 +78,12 @@ class RunStatus:
     counts: dict[str, int] = field(default_factory=dict[str, int])
     escalations: tuple[str, ...] = field(default_factory=tuple)
     pending_summary: str = ""
+    # Observability heartbeat (see `ads/activity.py`): what's running right
+    # now (label/kind/model/started_at), how long it's been running, and a
+    # bounded tail of its live activity log — `None`/`0`/`()` when idle.
+    current_activity: dict[str, str] | None = None
+    activity_elapsed_seconds: int | None = None
+    activity_tail: tuple[str, ...] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +118,37 @@ def _scratch_checkpoint(path: Path) -> str:
         if line:
             return line
     return ""
+
+
+# ---------------------------------------------------------------------------
+# activity heartbeat (see ads/activity.py)
+# ---------------------------------------------------------------------------
+
+
+def _elapsed_seconds(started_at: str) -> int | None:
+    """Whole seconds since `started_at` (state.py's `%Y-%m-%dT%H:%M:%SZ`,
+    always UTC), or `None` if it can't be parsed — never raises."""
+    try:
+        started = time.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    started_epoch = calendar.timegm(started)
+    elapsed = int(time.time() - started_epoch)
+    return max(elapsed, 0)
+
+
+def _tail_activity_log(
+    layout: RunLayout, label: str, *, max_lines: int = DEFAULT_ACTIVITY_TAIL
+) -> tuple[str, ...]:
+    """Last `max_lines` of `activity/<label>.log`. Read-only, bounded — never
+    the whole log. `()` if the file doesn't exist. (`ads/tui.py` has its own
+    sibling of this for drilling into an arbitrary, possibly non-active,
+    task's log — this one only ever reads the CURRENTLY active label.)"""
+    path = layout.activity_dir / f"{label}.log"
+    if not path.exists():
+        return ()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return tuple(lines[-max_lines:])
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +291,12 @@ def read_status(layout: RunLayout, *, event_tail: int = DEFAULT_EVENT_TAIL) -> R
     open_escalations = tuple(
         sorted(rid for rid, status in state.escalations.items() if status == "pending")
     )
+    current_activity = getattr(state, "current_activity", None)
+    activity_elapsed_seconds: int | None = None
+    activity_tail: tuple[str, ...] = ()
+    if current_activity is not None:
+        activity_elapsed_seconds = _elapsed_seconds(current_activity.get("started_at", ""))
+        activity_tail = _tail_activity_log(layout, current_activity.get("label", ""))
     return RunStatus(
         run_id=layout.run_id,
         phase=state.phase,
@@ -265,12 +311,30 @@ def read_status(layout: RunLayout, *, event_tail: int = DEFAULT_EVENT_TAIL) -> R
         counts=_counts_by_status(rows),
         escalations=open_escalations,
         pending_summary=_pending_summary(state, rows),
+        current_activity=current_activity,
+        activity_elapsed_seconds=activity_elapsed_seconds,
+        activity_tail=activity_tail,
     )
 
 
 # ---------------------------------------------------------------------------
 # renderers
 # ---------------------------------------------------------------------------
+
+
+def _format_elapsed(seconds: int) -> str:
+    minutes, secs = divmod(max(seconds, 0), 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _render_now_line(status: RunStatus) -> str:
+    activity = status.current_activity
+    if activity is None:
+        return "NOW:          — idle —"
+    elapsed = _format_elapsed(status.activity_elapsed_seconds or 0)
+    label = activity.get("label", "?")
+    model = activity.get("model", "?")
+    return f"NOW:          ▶ {label} · {model} · {elapsed}"
 
 
 def render_plain(status: RunStatus) -> str:
@@ -283,9 +347,15 @@ def render_plain(status: RunStatus) -> str:
         f"adapter:      {status.adapter}",
         f"updated_at:   {status.updated_at}",
         f"attached:     {status.attached}",
+        _render_now_line(status),
         f"pending:      {status.pending_summary}",
         f"counts:       {status.counts}",
     ]
+    if status.activity_tail:
+        lines.append("")
+        lines.append("live:")
+        for line in status.activity_tail:
+            lines.append(f"  {line}")
     if status.escalations:
         lines.append(f"escalations:  {', '.join(status.escalations)}")
     lines.append("")

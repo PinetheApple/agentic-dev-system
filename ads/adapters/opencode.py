@@ -54,6 +54,41 @@ def _event_text(event: dict[str, object]) -> str | None:
     return text if isinstance(text, str) else None
 
 
+def _render_opencode_event(event: dict[str, object]) -> str | None:
+    """Compact human trace line for one parsed NDJSON event, or `None` for
+    noise. Only the `text` event carries user-facing content today (see the
+    module docstring) — `step_start`/`step_finish` and anything unrecognized
+    are skipped."""
+    text = _event_text(event)
+    return text.strip() if text and text.strip() else None
+
+
+def _tee_activity_log(stdout: str, activity_log: Path) -> None:
+    """Post-hoc tee (ticket: observable in-flight runs): OpenCode is the
+    secondary harness, so unlike the claude adapter this doesn't stream
+    live off the process — it renders the already-captured NDJSON events
+    to `activity_log` once the batch `subprocess.run` call returns, which is
+    low-churn and keeps this adapter's `subprocess.run` path unchanged."""
+    activity_log.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = cast(object, json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        rendered = _render_opencode_event(cast(dict[str, object], event))
+        if rendered is not None:
+            lines.append(rendered)
+    if lines:
+        with activity_log.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+
 def parse_opencode_stdout(stdout: str) -> tuple[str, StructuredPayload | None]:
     """Pure parse of `opencode run --format json` NDJSON stdout into the
     model's answer text (concatenation of all `text` event parts, in
@@ -110,6 +145,8 @@ class OpenCodeAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         cmd = [
             self._opencode_bin,
@@ -163,6 +200,9 @@ class OpenCodeAdapter:
 
         if proc.returncode != 0:
             return RunResult(text=proc.stderr or proc.stdout, structured=None, exit_status="error")
+
+        if activity_log is not None:
+            _tee_activity_log(proc.stdout, activity_log)
 
         text, structured = parse_opencode_stdout(proc.stdout)
         return RunResult(text=text, structured=structured, exit_status="ok")

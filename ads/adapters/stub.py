@@ -70,7 +70,13 @@ class StubAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
+        if activity_log is not None:
+            activity_log.parent.mkdir(parents=True, exist_ok=True)
+            with activity_log.open("a", encoding="utf-8") as fh:
+                fh.write("stub: run started\n")
         if "PHASE:plan" in prompt:
             return RunResult(text="stub plan", structured=_PLAN_RESPONSE, exit_status="ok")
         if "PHASE:validate-judgment" in prompt or "PHASE:validate-integration" in prompt:

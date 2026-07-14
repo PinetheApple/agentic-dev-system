@@ -54,6 +54,10 @@ class RunLayout:
         return self.root / "scratch"
 
     @property
+    def activity_dir(self) -> Path:
+        return self.root / "activity"
+
+    @property
     def escalations_dir(self) -> Path:
         return self.root / "escalations"
 
@@ -74,6 +78,7 @@ class RunLayout:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
         self.escalations_dir.mkdir(parents=True, exist_ok=True)
+        self.activity_dir.mkdir(parents=True, exist_ok=True)
 
     def link_current(self) -> None:
         """Point `runs/current` -> this run (best-effort symlink)."""

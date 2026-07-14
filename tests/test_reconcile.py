@@ -57,6 +57,8 @@ class _FixingAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.calls.append(cwd)
         (cwd / self.offending_relpath).unlink(missing_ok=True)
@@ -87,6 +89,8 @@ class _NoOpAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.calls += 1
         return RunResult(
@@ -110,6 +114,8 @@ class _NeverCalledAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         raise AssertionError("adapter.run must not be called when reconcile is not configured")
 
@@ -246,6 +252,8 @@ class _DualPhaseAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         if "PHASE:reconcile" in prompt:
             self.calls.append("reconcile")

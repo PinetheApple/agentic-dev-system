@@ -38,11 +38,13 @@ from pathlib import Path
 
 from ads import resume as resume_module
 from ads import sandbox, worktree
+from ads.activity import run_with_activity
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
 from ads.layout import RunLayout
 from ads.prompt import compose
 from ads.sandbox import SandboxPolicy
+from ads.state import State
 from ads.tasks import ExitCriterion, ExitCriterionCheck, Task
 
 CMD_TIMEOUT_SECONDS = 300
@@ -98,16 +100,28 @@ def evaluate_task_at(
     cwd: Path,
     diff_text: str,
     policy: SandboxPolicy = _DISABLED_SANDBOX_POLICY,
+    state: State | None = None,
 ) -> TaskValidation:
     """Evaluate `task`'s exit criteria at an explicit `cwd` (for `cmd`
     criteria) and `diff_text` (for `judgment` criteria) — both supplied by
     the caller rather than self-computed, so this works identically whether
     called pre-merge from a live worktree (`ads/dispatch.py`) or from the
     in-place, non-git fallback. `policy` jails the `cmd` gate (ticket 011);
-    it defaults to disabled so existing callers/tests are unaffected."""
+    it defaults to disabled so existing callers/tests are unaffected.
+    `state` is optional (observability heartbeat, see `ads/activity.py`) —
+    when omitted, the judgment critic calls `adapter.run()` directly exactly
+    as before, so existing callers/tests are unaffected."""
     results = [
         _evaluate_criterion(
-            layout, cfg, adapter, task, criterion, cwd=cwd, diff_text=diff_text, policy=policy
+            layout,
+            cfg,
+            adapter,
+            task,
+            criterion,
+            cwd=cwd,
+            diff_text=diff_text,
+            policy=policy,
+            state=state,
         )
         for criterion in task.exit_criteria
     ]
@@ -124,10 +138,13 @@ def _evaluate_criterion(
     cwd: Path,
     diff_text: str,
     policy: SandboxPolicy,
+    state: State | None,
 ) -> CriterionResult:
     if criterion.check == "cmd":
         return _run_cmd_criterion(cwd, criterion, policy)
-    return _run_judgment_criterion(layout, cfg, adapter, task, criterion, diff_text=diff_text)
+    return _run_judgment_criterion(
+        layout, cfg, adapter, task, criterion, diff_text=diff_text, state=state
+    )
 
 
 def _run_cmd_criterion(
@@ -167,6 +184,7 @@ def _run_judgment_criterion(
     criterion: ExitCriterion,
     *,
     diff_text: str,
+    state: State | None = None,
 ) -> CriterionResult:
     task_body = (
         cfg.phases["validate"]
@@ -176,7 +194,7 @@ def _run_judgment_criterion(
             diff_text or "(no diff: nothing changed under this task's declared `owns` paths)",
         )
     )
-    result = _run_critic(layout, cfg, adapter, task_body)
+    result = _run_critic(layout, cfg, adapter, task_body, label=f"{task.id}-judgment", state=state)
     passed, evidence, cited = _parse_verdict(result)
     return CriterionResult(
         check="judgment", value=criterion.value, passed=passed, detail=evidence, cited_paths=cited
@@ -188,12 +206,14 @@ def _run_judgment_criterion(
 # ---------------------------------------------------------------------------
 
 
-def run_integration_critic(layout: RunLayout, cfg: Config, adapter: Adapter) -> IntegrationVerdict:
+def run_integration_critic(
+    layout: RunLayout, cfg: Config, adapter: Adapter, *, state: State | None = None
+) -> IntegrationVerdict:
     diff_text = resume_module.owns_diff(layout.repo, ["."])
     task_body = cfg.phases["validate-integration"].body.replace(
         "{diff}", diff_text or "(no diff: nothing changed in this run)"
     )
-    result = _run_critic(layout, cfg, adapter, task_body)
+    result = _run_critic(layout, cfg, adapter, task_body, label="integration", state=state)
     passed, evidence, cited = _parse_verdict(result)
     return IntegrationVerdict(passed=passed, evidence=evidence, cited_paths=cited)
 
@@ -216,13 +236,33 @@ def attribute_paths(all_tasks: list[Task], cited_paths: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _run_critic(layout: RunLayout, cfg: Config, adapter: Adapter, task_body: str) -> RunResult:
+def _run_critic(
+    layout: RunLayout,
+    cfg: Config,
+    adapter: Adapter,
+    task_body: str,
+    *,
+    label: str,
+    state: State | None = None,
+) -> RunResult:
     spec_text = layout.spec.read_text(encoding="utf-8") if layout.spec.exists() else ""
     critic = cfg.experts.get("critic")
     critic_body = _critic_body(critic.body if critic else "", adapter)
     prompt = compose(cfg.base, critic_body, "", task_body, spec=spec_text)
     allowed_tools = list(critic.tools) if critic and critic.tools else None
-    return adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
+    if state is None:
+        return adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
+    return run_with_activity(
+        adapter,
+        layout,
+        state,
+        label=label,
+        kind="validate",
+        prompt=prompt,
+        cwd=layout.repo,
+        allowed_tools=allowed_tools,
+        tier="standard",
+    )
 
 
 def _critic_body(body: str, adapter: Adapter) -> str:

@@ -72,6 +72,8 @@ class WritingAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         with self._lock:
             self._active += 1

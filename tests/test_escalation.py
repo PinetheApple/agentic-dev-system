@@ -70,6 +70,8 @@ class _AgentRequestAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.calls += 1
         payload: StructuredPayload = {
@@ -101,6 +103,8 @@ class _AlwaysDoneAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         payload: StructuredPayload = {"status": "done", "summary": "did the thing"}
         return RunResult(text=json.dumps(payload), structured=payload, exit_status="ok")

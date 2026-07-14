@@ -72,6 +72,12 @@ class State:
     # Ticket 010: machine-owned cursor over control.jsonl — count of control
     # commands already drained, same spirit as `step_counts`.
     control_cursor: int = 0
+    # Observability heartbeat: set the instant a long-running `adapter.run()`
+    # begins, cleared when it ends (`ads/activity.py`'s `run_with_activity`
+    # is the single choke point that sets/clears this). A plain dict, not a
+    # dataclass, so state.json serialization stays trivial — keys: `label`,
+    # `kind`, `model`, `started_at` (iso8601 Z).
+    current_activity: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -117,6 +123,9 @@ class State:
             attached=bool(data.get("attached", False)),
             paused=bool(data.get("paused", False)),
             control_cursor=int(data.get("control_cursor", 0)),
+            current_activity=dict(data["current_activity"])
+            if data.get("current_activity") is not None
+            else None,
         )
 
 

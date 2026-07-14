@@ -63,6 +63,8 @@ class ScriptedStatusAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.call_count += 1
         payload = cast(StructuredPayload, {STATUS_KEY: self._status, "summary": "never finishes"})

@@ -7,6 +7,7 @@ what to do next; events.jsonl is write-only audit.
 from __future__ import annotations
 
 from ads import control, dispatch, resplit, validate
+from ads.activity import run_with_activity
 from ads.adapters.base import Adapter, TaskPayload
 from ads.config import Config
 from ads.layout import RunLayout
@@ -160,7 +161,17 @@ def _run_plan(layout: RunLayout, cfg: Config, adapter: Adapter, state: State) ->
     prompt = compose(cfg.base, plan_expert.body, design="", task_body=task_body)
 
     allowed_tools = list(plan_expert.tools) if plan_expert.tools else None
-    result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
+    result = run_with_activity(
+        adapter,
+        layout,
+        state,
+        label="plan",
+        kind="plan",
+        prompt=prompt,
+        cwd=layout.repo,
+        allowed_tools=allowed_tools,
+        tier="standard",
+    )
     if result.exit_status != "ok" or not result.structured:
         return _halt(layout, state, f"plan run failed: {result.text[:200]}")
 
@@ -245,7 +256,7 @@ def _run_dispatch(layout: RunLayout, cfg: Config, adapter: Adapter, state: State
 
 def _run_validate(layout: RunLayout, cfg: Config, adapter: Adapter, state: State) -> State:
     all_tasks = load_tasks(layout)
-    integration = validate.run_integration_critic(layout, cfg, adapter)
+    integration = validate.run_integration_critic(layout, cfg, adapter, state=state)
     validate.write_report(layout, [], integration=integration)
 
     if not integration.passed:

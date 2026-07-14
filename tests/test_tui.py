@@ -13,6 +13,7 @@ from ads.layout import RunLayout
 from ads.status import EventLine, RunStatus, TaskRow
 from ads.tui import (
     TUIUnavailable,
+    _read_activity_tail,  # pyright: ignore[reportPrivateUsage]
     _read_scratch_tail,  # pyright: ignore[reportPrivateUsage]
     build_detail_frame,
     build_overview_frame,
@@ -40,7 +41,14 @@ def _row(
     )
 
 
-def _status(tasks: tuple[TaskRow, ...], events: tuple[EventLine, ...] = ()) -> RunStatus:
+def _status(
+    tasks: tuple[TaskRow, ...],
+    events: tuple[EventLine, ...] = (),
+    *,
+    current_activity: dict[str, str] | None = None,
+    activity_elapsed_seconds: int | None = None,
+    activity_tail: tuple[str, ...] = (),
+) -> RunStatus:
     return RunStatus(
         run_id="run-1",
         phase="dispatch",
@@ -55,6 +63,9 @@ def _status(tasks: tuple[TaskRow, ...], events: tuple[EventLine, ...] = ()) -> R
         counts={},
         escalations=(),
         pending_summary="phase dispatch, 1 active",
+        current_activity=current_activity,
+        activity_elapsed_seconds=activity_elapsed_seconds,
+        activity_tail=activity_tail,
     )
 
 
@@ -116,6 +127,53 @@ class TestBuildOverviewFrame(unittest.TestCase):
 
         self.assertEqual(frame.rows, ())
 
+    def test_now_line_shows_label_model_and_elapsed_when_active(self) -> None:
+        status = _status(
+            (_row("01-a"),),
+            current_activity={"label": "01-a", "kind": "dispatch", "model": "claude-sonnet-5"},
+            activity_elapsed_seconds=65,
+        )
+
+        frame = build_overview_frame(status, width=100, selected=0)
+
+        self.assertIn("01-a", frame.now_line)
+        self.assertIn("claude-sonnet-5", frame.now_line)
+        self.assertIn("01:05", frame.now_line)
+        self.assertLessEqual(len(frame.now_line), 100)
+
+    def test_now_line_shows_idle_marker_when_no_activity(self) -> None:
+        status = _status((_row("01-a"),))
+
+        frame = build_overview_frame(status, width=100, selected=0)
+
+        self.assertIn("idle", frame.now_line)
+
+    def test_live_panel_contains_activity_tail_lines(self) -> None:
+        status = _status(
+            (_row("01-a"),),
+            current_activity={"label": "01-a", "kind": "dispatch", "model": "claude-sonnet-5"},
+            activity_elapsed_seconds=5,
+            activity_tail=("→ Read a.py", "  ✓ file contents ok"),
+        )
+
+        frame = build_overview_frame(status, width=100, selected=0)
+
+        self.assertEqual(frame.live_lines, ("→ Read a.py", "  ✓ file contents ok"))
+
+    def test_now_line_and_live_lines_truncated_to_width(self) -> None:
+        status = _status(
+            (_row("01-a"),),
+            current_activity={"label": "a" * 60, "kind": "dispatch", "model": "b" * 60},
+            activity_elapsed_seconds=5,
+            activity_tail=("x" * 200,),
+        )
+
+        frame = build_overview_frame(status, width=40, selected=0)
+
+        self.assertLessEqual(len(frame.now_line), 40)
+        for line in frame.live_lines:
+            self.assertLessEqual(len(line), 40)
+
 
 class TestBuildDetailFrame(unittest.TestCase):
     def test_shows_task_id_and_scratch_tail(self) -> None:
@@ -150,6 +208,16 @@ class TestBuildDetailFrame(unittest.TestCase):
         frame = build_detail_frame(status, "not-a-task", (), width=100)
 
         self.assertIn("not-a-task", frame.header)
+
+    def test_activity_tail_populates_live_lines_separately_from_scratch(self) -> None:
+        status = _status((_row("01-a", status="active"),))
+        scratch = ("## Objective", "Build a.")
+        activity = ("→ Read a.py", "  ✓ ok")
+
+        frame = build_detail_frame(status, "01-a", scratch, width=100, activity_tail=activity)
+
+        self.assertEqual(frame.detail_lines, scratch)
+        self.assertEqual(frame.live_lines, activity)
 
 
 class TestBuildWaitingFrame(unittest.TestCase):
@@ -195,6 +263,30 @@ class TestReadScratchTail(unittest.TestCase):
 
         self.assertLessEqual(len(tail), 40)
         self.assertEqual(tail, ("only one line",))
+
+
+class TestReadActivityTail(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        self.layout = RunLayout(repo=self.repo, run_id="run-1")
+        self.layout.scaffold()
+
+    def test_returns_last_n_lines(self) -> None:
+        lines = [f"line {i}" for i in range(100)]
+        (self.layout.activity_dir / "01-a.log").write_text("\n".join(lines), encoding="utf-8")
+
+        tail = _read_activity_tail(self.layout, "01-a", max_lines=10)
+
+        self.assertEqual(len(tail), 10)
+        self.assertEqual(tail[-1], "line 99")
+        self.assertEqual(tail[0], "line 90")
+
+    def test_missing_file_returns_empty_tuple(self) -> None:
+        tail = _read_activity_tail(self.layout, "does-not-exist")
+
+        self.assertEqual(tail, ())
 
 
 class TestRunTuiGuard(unittest.TestCase):

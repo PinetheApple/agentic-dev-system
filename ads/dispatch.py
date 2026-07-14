@@ -42,6 +42,7 @@ from pathlib import Path
 
 from ads import escalation, reconcile, resplit, sandbox, validate, worktree
 from ads import resume as resume_module
+from ads.activity import run_with_activity
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
 from ads.layout import RunLayout
@@ -105,7 +106,17 @@ def _dispatch_inplace(
         resume_module.scaffold_scratch(layout, task)
         prompt, allowed_tools = _compose_task_prompt(cfg, layout, task, spec_text, design_text)
         state.step_counts[task.id] = state.step_counts.get(task.id, 0) + 1
-        result = adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier=task.tier)
+        result = run_with_activity(
+            adapter,
+            layout,
+            state,
+            label=task.id,
+            kind="dispatch",
+            prompt=prompt,
+            cwd=layout.repo,
+            allowed_tools=allowed_tools,
+            tier=task.tier,
+        )
 
         try:
             _apply_run_result(layout, state, task, result)
@@ -269,7 +280,7 @@ def _gate_and_route(
 
     policy = sandbox.policy_from_harness(cfg.harness)
     tv = validate.evaluate_task_at(
-        layout, cfg, adapter, task, cwd=cwd, diff_text=diff_text, policy=policy
+        layout, cfg, adapter, task, cwd=cwd, diff_text=diff_text, policy=policy, state=state
     )
     if tv.passed:
         return True
@@ -317,7 +328,24 @@ def _dispatch_one_isolated(
         wt = worktree.create_worktree(layout.repo, base_sha, layout.run_id, task.id)
         state.step_counts[task.id] = state.step_counts.get(task.id, 0) + 1
 
-    result = adapter.run(prompt, cwd=wt.path, allowed_tools=allowed_tools, tier=task.tier)
+    # PARALLEL dispatch (ticket 006): several tasks may call this concurrently,
+    # each with its own worktree. `state.current_activity` is single-valued
+    # and best-effort here ("last writer wins" — see ads/activity.py's module
+    # docstring); each task still gets its OWN `activity/<task_id>.log`, the
+    # real per-task live stream, regardless of who currently owns the
+    # heartbeat field. `git_lock` guards the `state` mutation only.
+    result = run_with_activity(
+        adapter,
+        layout,
+        state,
+        label=task.id,
+        kind="dispatch",
+        prompt=prompt,
+        cwd=wt.path,
+        allowed_tools=allowed_tools,
+        tier=task.tier,
+        lock=git_lock,
+    )
     task_ok = _task_succeeded(result)
 
     with git_lock:
@@ -355,7 +383,7 @@ def _dispatch_one_isolated(
         # the halt-to-human path below is identical to pre-reconcile behavior.
         # Held outside git_lock: the slow adapter.run() must never block other
         # tasks' merges.
-        outcome = reconcile.attempt(layout, cfg, adapter, task, wt, outcome, git_lock)
+        outcome = reconcile.attempt(layout, cfg, adapter, task, wt, outcome, git_lock, state=state)
 
     with git_lock:
         if not outcome.merged:

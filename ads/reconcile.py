@@ -22,11 +22,12 @@ from __future__ import annotations
 import threading
 
 from ads import worktree
+from ads.activity import run_with_activity
 from ads.adapters.base import Adapter, RunResult
 from ads.config import Config
 from ads.layout import RunLayout
 from ads.prompt import compose
-from ads.state import append_event
+from ads.state import State, append_event
 from ads.tasks import Task
 from ads.worktree import MergeOutcome, TaskWorktree
 
@@ -43,6 +44,8 @@ def attempt(
     wt: TaskWorktree,
     outcome: MergeOutcome,
     git_lock: threading.Lock,
+    *,
+    state: State | None = None,
 ) -> MergeOutcome:
     """Try to resolve `outcome`'s tripwire in-place and retry the merge.
 
@@ -50,14 +53,17 @@ def attempt(
     configured. Otherwise returns either a merged `MergeOutcome` (success)
     or the latest still-unmerged one (give up after a failing run or
     `RECONCILE_MAX_ATTEMPTS` exhaustion) — the caller halts exactly as it
-    would have without this module in either failure case.
+    would have without this module in either failure case. `state` is
+    optional (observability heartbeat, see `ads/activity.py`) — when
+    omitted, the reconcile agent calls `adapter.run()` directly exactly as
+    before, so existing callers/tests are unaffected.
     """
     if RECONCILE_EXPERT not in cfg.experts or RECONCILE_PHASE not in cfg.phases:
         return outcome
 
     current = outcome
     for attempt_number in range(1, RECONCILE_MAX_ATTEMPTS + 1):
-        result = _run_reconcile_agent(layout, cfg, adapter, task, wt, current)
+        result = _run_reconcile_agent(layout, cfg, adapter, task, wt, current, state=state)
         if result.exit_status != "ok":
             break
 
@@ -81,6 +87,8 @@ def _run_reconcile_agent(
     task: Task,
     wt: TaskWorktree,
     outcome: MergeOutcome,
+    *,
+    state: State | None = None,
 ) -> RunResult:
     expert = cfg.experts[RECONCILE_EXPERT]
     design_text = layout.design.read_text(encoding="utf-8")
@@ -95,4 +103,16 @@ def _run_reconcile_agent(
     )
     prompt = compose(cfg.base, expert.body, design_text, task_body, spec=spec_text)
     allowed_tools = list(expert.tools) if expert.tools else None
-    return adapter.run(prompt, cwd=wt.path, allowed_tools=allowed_tools, tier=task.tier)
+    if state is None:
+        return adapter.run(prompt, cwd=wt.path, allowed_tools=allowed_tools, tier=task.tier)
+    return run_with_activity(
+        adapter,
+        layout,
+        state,
+        label=f"{task.id}-reconcile",
+        kind="reconcile",
+        prompt=prompt,
+        cwd=wt.path,
+        allowed_tools=allowed_tools,
+        tier=task.tier,
+    )

@@ -242,6 +242,8 @@ class RecordingAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.prompts.append(prompt)
         payload: StructuredPayload = {"status": "done", "summary": "stub done"}

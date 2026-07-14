@@ -33,6 +33,8 @@ class StubFirewalledAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.calls.append((prompt, cwd, allowed_tools, tier))
         return RunResult(text=RAW_TRANSCRIPT_MARKER, structured=self._structured, exit_status="ok")

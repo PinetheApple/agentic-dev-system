@@ -64,6 +64,8 @@ class ScriptedAdapter:
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         payload: StructuredPayload
         if "PHASE:validate-integration" in prompt:

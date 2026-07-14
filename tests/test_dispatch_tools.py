@@ -45,6 +45,8 @@ class RecordingAdapter(StubAdapter):
         cwd: Path,
         allowed_tools: list[str] | None = None,
         tier: TaskTier = "standard",
+        *,
+        activity_log: Path | None = None,
     ) -> RunResult:
         self.calls.append((prompt, allowed_tools))
         return super().run(prompt, cwd, allowed_tools=allowed_tools, tier=tier)
