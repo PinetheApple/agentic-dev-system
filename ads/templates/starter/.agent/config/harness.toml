@@ -41,7 +41,9 @@ mem_max = "4G"
 cpu_quota = "200%"
 tasks_max = 512
 caps_required = false
-rw_paths = ["~/.claude"]
+# claude reads BOTH ~/.claude/ (dir: settings, session state) and the top-level
+# ~/.claude.json (main config) — bind both, or claude can't start in the jail.
+rw_paths = ["~/.claude", "~/.claude.json"]
 env_allowlist = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
 
 # --- native posture (dec 9, alternative to the driver-wrap [sandbox] above) ---

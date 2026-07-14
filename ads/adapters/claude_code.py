@@ -154,6 +154,10 @@ class ClaudeCodeAdapter:
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                # Headless: never inherit a terminal stdin. If the CLI ever
+                # tries to prompt (trust/onboarding), it must fail fast rather
+                # than hang the whole driver waiting on input that never comes.
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
             return RunResult(text=str(exc), structured=None, exit_status="error")

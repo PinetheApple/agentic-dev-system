@@ -192,6 +192,22 @@ def wrap(
     for path in policy.ro_paths:
         if Path(path).exists():
             bwrap_cmd += ["--ro-bind", path, path]
+    if not policy.deny_egress:
+        # Network is allowed, so DNS must actually resolve. `/etc/resolv.conf`
+        # is commonly a symlink into `/run/systemd/resolve/` (systemd-resolved);
+        # the `/etc` bind above brings the symlink but not its target, so it
+        # dangles, name resolution fails, and any networked command (e.g.
+        # `claude -p` reaching the API) hangs. When resolv.conf points outside
+        # `/etc`, bind its target directory so the existing symlink resolves.
+        # (We can't mount a file directly onto `/etc/resolv.conf` — `/etc` is a
+        # read-only bind, so bwrap can't create the mountpoint.) The stub
+        # listener it names (127.0.0.53) is reachable because the jail shares
+        # the host net namespace when egress isn't denied.
+        resolv = Path("/etc/resolv.conf")
+        if resolv.exists():
+            target_dir = resolv.resolve().parent
+            if target_dir != resolv.parent and target_dir.exists():
+                bwrap_cmd += ["--ro-bind", str(target_dir), str(target_dir)]
     for path in policy.ro_home_paths:
         if Path(path).exists():
             bwrap_cmd += ["--ro-bind", path, path]

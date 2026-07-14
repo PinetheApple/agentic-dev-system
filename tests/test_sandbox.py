@@ -34,7 +34,27 @@ class TestWrapDisabled(unittest.TestCase):
         self.assertIsNot(result, argv)  # returns a copy, never the same list object mutated
 
 
+_RESOLV = Path("/etc/resolv.conf")
+_RESOLV_SYMLINKED_OUT = _RESOLV.exists() and _RESOLV.resolve().parent != _RESOLV.parent
+
+
 class TestWrapEnabled(unittest.TestCase):
+    @unittest.skipUnless(
+        _RESOLV_SYMLINKED_OUT, "resolv.conf is not a symlink outside /etc on this host"
+    )
+    def test_deny_egress_false_binds_resolv_conf_target_dir(self) -> None:
+        # Network allowed -> DNS must resolve; the resolv.conf symlink target
+        # dir (e.g. /run/systemd/resolve) must be bound or lookups hang.
+        target = str(_RESOLV.resolve().parent)
+        allowed = sandbox.wrap(
+            ["true"], _cwd(), self._policy(deny_egress=False), {"PATH": "/usr/bin"}
+        )
+        self.assertIn(target, allowed)
+        # egress-denied jail has no host network, so it never adds the bind
+        denied_policy = self._policy(deny_egress=True)
+        denied = sandbox.wrap(["true"], _cwd(), denied_policy, {"PATH": "/usr/bin"})
+        self.assertNotIn(target, denied)
+
     def _policy(
         self,
         *,

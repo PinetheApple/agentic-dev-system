@@ -154,6 +154,9 @@ class OpenCodeAdapter:
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                # Headless: never inherit a terminal stdin, so a prompt fails
+                # fast instead of hanging the driver.
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
             return RunResult(text=str(exc), structured=None, exit_status="error")
