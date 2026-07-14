@@ -42,12 +42,28 @@ class SandboxConfig:
 
 
 @dataclass(frozen=True)
+class NativeConfig:
+    """Raw `[native]` knobs from harness.toml (ticket 011 dec-9). Deliberately
+    a SEPARATE table from `[sandbox]`: `[sandbox]` is the driver-wrap jail
+    policy (a host-level FS/net/cgroup boundary the driver builds itself);
+    `[native]` only applies when the harness advertises
+    `SANDBOX_NATIVE_CAPABILITY` and the driver does NOT wrap `run()` — in
+    that posture, these knobs become `claude` CLI flags applied INSIDE the
+    harness process for defense-in-depth, not a standalone jail. See
+    `ads/adapters/claude_code.py`'s `run()` for exactly how they're used."""
+
+    permission_mode: str | None = None
+    disallowed_tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     tier_model: dict[str, str]
     run_cmd: list[str]
     capabilities: list[str]
     max_parallel: int = DEFAULT_MAX_PARALLEL
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    native: NativeConfig = field(default_factory=NativeConfig)
 
 
 @dataclass(frozen=True)
@@ -114,12 +130,14 @@ def _load_harness(path: Path) -> HarnessConfig:
     run_section = cast(dict[str, Any], raw.get("run", {}))
     capabilities_section = cast(dict[str, Any], raw.get("capabilities", {}))
     sandbox_section = cast(dict[str, Any], raw.get("sandbox", {}))
+    native_section = cast(dict[str, Any], raw.get("native", {}))
     return HarnessConfig(
         tier_model=dict(raw.get("tier_model", {})),
         run_cmd=list(run_section.get("cmd", [])),
         capabilities=list(capabilities_section.get("flags", [])),
         max_parallel=int(capabilities_section.get("max_parallel", DEFAULT_MAX_PARALLEL)),
         sandbox=_load_sandbox(sandbox_section),
+        native=_load_native(native_section),
     )
 
 
@@ -138,6 +156,13 @@ def _load_sandbox(section: dict[str, Any]) -> SandboxConfig:
         mask_paths=tuple(section.get("mask_paths", ())),
         env_allowlist=tuple(section.get("env_allowlist", ())),
         caps_required=bool(section.get("caps_required", False)),
+    )
+
+
+def _load_native(section: dict[str, Any]) -> NativeConfig:
+    return NativeConfig(
+        permission_mode=section.get("permission_mode"),
+        disallowed_tools=tuple(section.get("disallowed_tools", ())),
     )
 
 

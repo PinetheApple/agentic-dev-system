@@ -13,6 +13,7 @@ from unittest import mock
 from ads import sandbox
 from ads.config import (
     HarnessConfig,
+    NativeConfig,
     SandboxConfig,
     _load_harness,  # pyright: ignore[reportPrivateUsage]
 )
@@ -555,6 +556,57 @@ flags = []
             harness = _load_harness(path)
 
             self.assertEqual(harness.sandbox, SandboxConfig())
+
+    def test_native_table_parses_into_native_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "harness.toml"
+            path.write_text(
+                """
+[tier_model]
+fast = "a"
+standard = "b"
+deep = "c"
+
+[run]
+cmd = ["claude", "-p"]
+
+[capabilities]
+flags = ["sandbox-native"]
+
+[native]
+permission_mode = "acceptEdits"
+disallowed_tools = ["WebFetch"]
+""",
+                encoding="utf-8",
+            )
+
+            harness = _load_harness(path)
+
+            self.assertEqual(harness.native.permission_mode, "acceptEdits")
+            self.assertEqual(harness.native.disallowed_tools, ("WebFetch",))
+
+    def test_absent_native_table_defaults_to_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "harness.toml"
+            path.write_text(
+                """
+[tier_model]
+fast = "a"
+standard = "b"
+deep = "c"
+
+[run]
+cmd = ["claude", "-p"]
+
+[capabilities]
+flags = []
+""",
+                encoding="utf-8",
+            )
+
+            harness = _load_harness(path)
+
+            self.assertEqual(harness.native, NativeConfig())
 
 
 class TestAdapterWiringDisabledIsUnchanged(unittest.TestCase):

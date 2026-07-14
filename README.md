@@ -143,12 +143,24 @@ uses.
 
 ### Sandbox / containment
 
-Per-repo containment (ticket 011) is configured in `harness.toml`'s
-`[sandbox]` table. It is **off by default** in the `driver init` starter
-config, because the jail (`bwrap --unshare-net`) would sever `claude -p`'s
-own API call, not just its tool subprocesses — see the comment block in the
-scaffolded `harness.toml` for the full reasoning, and `ads/sandbox.py`'s
-module docstring for the mechanism.
+Per-repo containment (ticket 011/dec-9) has two postures, selected by
+`harness.toml`. **driver-wrap** (default): the `[sandbox]` table configures a
+`bwrap` FS/secret/cgroup jail the driver builds around each `run()`, with
+`deny_egress = false` keeping the network `claude -p` needs — self-contained
+on a bare host, off by default in the `driver init` starter config for the
+reason above. **native**: add `sandbox-native` to `[capabilities] flags` and
+the driver skips its inner wrap entirely (see `SANDBOX_NATIVE_CAPABILITY` in
+`ads/sandbox.py`); this posture is for running the *whole* driver inside an
+outer container/VM that owns the real host-level boundary, with `[native]`
+(`permission_mode`, `disallowed_tools`) adding claude-code's own
+least-authority flags inside that boundary as defense-in-depth. Honest
+residual: those claude flags gate tool *invocation*, not raw filesystem
+reads of a path, so they are not a standalone host jail on their own —
+closing the token-exfil gap fully needs real process separation (an
+egress-denying outer container, or a future API-based adapter that keeps
+the model call out of a tool-capable jail). See the commented `[native]`
+example in the scaffolded `harness.toml` for the toggle, and
+`ads/sandbox.py`'s module docstring for the driver-wrap mechanism.
 
 ## Examples
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ads.adapters.claude_code import ClaudeCodeAdapter, parse_claude_stdout
-from ads.config import HarnessConfig
+from ads.config import HarnessConfig, NativeConfig
 from ads.sandbox import SandboxPolicy
 
 
@@ -133,6 +133,77 @@ class TestRunAllowedToolsArgv(unittest.TestCase):
 
         cmd = captured["cmd"]
         self.assertEqual(cmd[-4:], ["--allowedTools", "Read", "Edit", "Write"])
+
+
+def _run_and_capture(adapter: ClaudeCodeAdapter, **run_kwargs: Any) -> list[str]:
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            cmd, returncode=0, stdout=json.dumps({"type": "result", "result": "{}"}), stderr=""
+        )
+
+    real_run = subprocess.run
+    subprocess.run = fake_run  # type: ignore[assignment]
+    try:
+        adapter.run("do the thing", cwd=Path(), tier="standard", **run_kwargs)
+    finally:
+        subprocess.run = real_run  # type: ignore[assignment]
+    return captured["cmd"]
+
+
+class TestRunNativePosture(unittest.TestCase):
+    """dec 9: `sandbox-native` capability + `[native]` knobs inject
+    least-authority claude flags, but never a permissions bypass."""
+
+    def test_native_mode_emits_permission_mode_and_disallowed_tools(self) -> None:
+        harness = HarnessConfig(
+            tier_model={"standard": "claude-sonnet-5"},
+            run_cmd=["claude", "-p"],
+            capabilities=["tools", "allowedtools-cli", "sandbox-native"],
+            native=NativeConfig(
+                permission_mode="acceptEdits",
+                disallowed_tools=("WebFetch", "WebSearch"),
+            ),
+        )
+        adapter = ClaudeCodeAdapter(harness, policy=SandboxPolicy(enabled=False))
+
+        cmd = _run_and_capture(adapter, allowed_tools=["Read", "Edit"])
+
+        self.assertIn("--permission-mode", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--permission-mode") : cmd.index("--permission-mode") + 2],
+            ["--permission-mode", "acceptEdits"],
+        )
+        disallowed_idx = cmd.index("--disallowedTools")
+        self.assertEqual(
+            cmd[disallowed_idx : disallowed_idx + 3],
+            ["--disallowedTools", "WebFetch", "WebSearch"],
+        )
+        # --allowedTools stays last, unaffected by the native flags.
+        self.assertEqual(cmd[-3:], ["--allowedTools", "Read", "Edit"])
+        bypass_flags = ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions")
+        for bypass_flag in bypass_flags:
+            self.assertNotIn(bypass_flag, cmd)
+
+    def test_non_native_mode_omits_native_flags(self) -> None:
+        harness = HarnessConfig(
+            tier_model={"standard": "claude-sonnet-5"},
+            run_cmd=["claude", "-p"],
+            capabilities=["tools", "allowedtools-cli"],
+            native=NativeConfig(permission_mode="acceptEdits", disallowed_tools=("WebFetch",)),
+        )
+        adapter = ClaudeCodeAdapter(harness, policy=SandboxPolicy(enabled=False))
+
+        cmd = _run_and_capture(adapter, allowed_tools=["Read"])
+
+        self.assertNotIn("--permission-mode", cmd)
+        self.assertNotIn("--disallowedTools", cmd)
+        self.assertEqual(cmd[-2:], ["--allowedTools", "Read"])
+        bypass_flags = ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions")
+        for bypass_flag in bypass_flags:
+            self.assertNotIn(bypass_flag, cmd)
 
 
 if __name__ == "__main__":

@@ -98,6 +98,36 @@ class ClaudeCodeAdapter:
             "--output-format",
             "json",
         ]
+
+        is_native = SANDBOX_NATIVE_CAPABILITY in self.capabilities()
+        if is_native:
+            # dec 9: the harness advertises its own native sandbox, so the
+            # driver does not double-wrap the whole process in bwrap — that
+            # host-level boundary is expected to come from an OUTER
+            # container/VM around the whole driver instead. What we CAN do
+            # here is tighten claude's own tool gating as defense-in-depth.
+            # Honesty check (do not oversell): `--permission-mode` /
+            # `--disallowedTools` gate tool *invocation* inside claude, not
+            # raw filesystem reads of a path — they do not stop a rogue Bash
+            # from reading anything the outer container exposes. Closing
+            # that residual needs real process separation (outer
+            # deny-egress container, or a future API-based adapter that
+            # keeps the model call out of a tool-capable jail).
+            #
+            # Hard invariant, deliberate and tested: this adapter NEVER
+            # emits `--dangerously-skip-permissions` /
+            # `--allow-dangerously-skip-permissions`. Agents never
+            # self-grant a bypass of claude's own permission system (dec
+            # 6/dec 9) — that flag must never appear in built argv, in any
+            # mode.
+            if self._harness.native.permission_mode is not None:
+                cmd += ["--permission-mode", self._harness.native.permission_mode]
+            if self._harness.native.disallowed_tools:
+                # Space-variadic, same shape as --allowedTools below — must
+                # not be last, since a trailing variadic would swallow the
+                # following --allowedTools flag/tokens.
+                cmd += ["--disallowedTools", *self._harness.native.disallowed_tools]
+
         if allowed_tools:
             # `--allowedTools` is space-variadic (claude 2.1.207): it takes
             # each tool name as its own argv token, not a single
@@ -107,12 +137,7 @@ class ClaudeCodeAdapter:
             cmd += ["--allowedTools", *allowed_tools]
 
         timeout_seconds = DEFAULT_TIMEOUT_SECONDS
-        if SANDBOX_NATIVE_CAPABILITY in self.capabilities():
-            # dec 9: the harness advertises its own native sandbox, so the
-            # driver does not double-wrap — specified-but-unvalidated, no
-            # ref harness does this today (see ads/sandbox.py docstring).
-            pass
-        else:
+        if not is_native:
             sandbox.require(self._policy)  # fail-closed
             env = sandbox.resolve_env(self._policy, os.environ)
             cmd = sandbox.wrap_command(cmd, cwd, self._policy, env)

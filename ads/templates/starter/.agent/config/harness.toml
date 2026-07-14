@@ -43,3 +43,26 @@ tasks_max = 512
 caps_required = false
 rw_paths = ["~/.claude"]
 env_allowlist = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+
+# --- native posture (dec 9, alternative to the driver-wrap [sandbox] above) ---
+# Use this instead of [sandbox] when the WHOLE ads driver already runs inside
+# an outer container/VM that owns the real host-level jail (network egress
+# deny, no host $HOME, etc). In that setup the driver's own bwrap wrap is
+# redundant, so the harness self-declares containment via `sandbox-native`
+# and the driver skips its inner wrap (ads/sandbox.py's SANDBOX_NATIVE_CAPABILITY).
+# [native] then adds claude-code's own least-authority flags as
+# defense-in-depth INSIDE that outer boundary — NOT a standalone host jail:
+# `--permission-mode`/`--disallowedTools` gate tool *invocation*, not raw
+# filesystem reads of a path, so a rogue Bash can still read anything the
+# outer container exposes. To switch to this posture, uncomment below AND:
+#   [capabilities] flags = [..., "sandbox-native"]
+#   [sandbox] enabled = false   (explicit — the driver won't wrap in native
+#                                 mode anyway, but don't leave it ambiguous)
+#
+# [native]
+# # "acceptEdits": claude auto-accepts file edit tool calls without an
+# # interactive prompt, but still refuses any tool not otherwise allowed —
+# # good for unattended runs where you still want an allowlist/denylist to
+# # bite. See `claude --help` for the full set of documented modes.
+# permission_mode = "acceptEdits"
+# disallowed_tools = ["WebFetch", "WebSearch"]

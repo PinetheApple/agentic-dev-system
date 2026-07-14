@@ -132,6 +132,10 @@ class OpenCodeAdapter:
             # dec 9: the harness advertises its own native sandbox, so the
             # driver does not double-wrap — specified-but-unvalidated, no
             # ref harness does this today (see ads/sandbox.py docstring).
+            # Unlike claude-code, opencode has no --permission-mode /
+            # --disallowedTools CLI surface; native-posture least-authority
+            # enforcement for it is delegated to its own opencode.json /
+            # agent permission config (fog for this slice — not built here).
             pass
         else:
             sandbox.require(self._policy)  # fail-closed
