@@ -301,6 +301,33 @@ class TestWrapCommand(unittest.TestCase):
 
         probe.assert_not_called()
 
+    def test_ro_binds_the_resolved_executable_tree(self) -> None:
+        # The jail ro-binds /usr etc. but a harness CLI often lives under
+        # ~/.local/bin as a symlink into a versioned dir — both must be bound
+        # or bwrap fails with `execvp <tool>: No such file or directory`.
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            real_dir = Path(tmp) / "share" / "tool" / "versions"
+            real_dir.mkdir(parents=True)
+            target = real_dir / "1.0.0"
+            target.write_text("#!/bin/sh\n")
+            link = bin_dir / "mytool"
+            bin_dir.mkdir()
+            link.symlink_to(target)
+
+            policy = sandbox.SandboxPolicy(enabled=True)
+            with mock.patch.object(sandbox.shutil, "which", return_value=str(link)):
+                result = sandbox.wrap_command(["mytool", "--help"], _cwd(), policy, {})
+
+            self.assertIn(str(bin_dir), result)  # symlink dir bound
+            self.assertIn(str(real_dir), result)  # realpath target dir bound
+
+    def test_unresolvable_executable_adds_no_binds(self) -> None:
+        policy = sandbox.SandboxPolicy(enabled=True)
+        with mock.patch.object(sandbox.shutil, "which", return_value=None):
+            result = sandbox.wrap_command(["ghost-xyz"], _cwd(), policy, {})
+        self.assertEqual(result[0], "bwrap")  # still wrapped, just no exec binds
+
 
 class TestScopeAvailable(unittest.TestCase):
     def test_missing_binary_returns_false(self) -> None:

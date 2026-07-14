@@ -29,7 +29,7 @@ import subprocess
 import sys
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -239,17 +239,42 @@ def _resolve_enable_scope(policy: SandboxPolicy) -> bool:
     return False
 
 
+def _executable_ro_binds(argv: list[str]) -> tuple[str, ...]:
+    """Resolve `argv`'s executable on the host and return the directories that
+    must be ro-bound for it to be found and runnable *inside* the jail: the
+    dir of the resolved binary AND the dir of its fully-resolved realpath
+    target. Harness CLIs are commonly a `~/.local/bin/<tool>` symlink into a
+    versioned install dir (e.g. `claude` -> `~/.local/share/claude/versions/
+    <ver>`); binding only `/usr`/`/bin` leaves both invisible, so `bwrap`
+    fails with `execvp <tool>: No such file or directory`. Empty when the
+    executable can't be located (the jailed exec then fails loudly on its
+    own, which is the honest outcome)."""
+    if not argv:
+        return ()
+    resolved = shutil.which(argv[0])
+    if resolved is None:
+        return ()
+    which_dir = str(Path(resolved).parent)
+    real_dir = str(Path(resolved).resolve().parent)
+    return tuple(dict.fromkeys([which_dir, real_dir]))
+
+
 def wrap_command(
     argv: list[str], cwd: Path, policy: SandboxPolicy, env: Mapping[str, str]
 ) -> list[str]:
     """Impure composer: the entry point callers should use instead of raw
     `wrap`. Resolves whether the cgroup scope layer is actually usable on
     this host (`scope_available`) and applies the fail-closed/degrade
-    decision (`SandboxPolicy.caps_required`) before delegating to the pure
-    `wrap`. Identity passthrough when `policy.enabled` is False."""
+    decision (`SandboxPolicy.caps_required`), and ro-binds `argv`'s executable
+    tree so the wrapped command is actually reachable inside the jail, before
+    delegating to the pure `wrap`. Identity passthrough when `policy.enabled`
+    is False."""
     if not policy.enabled:
         return list(argv)
     enable_scope = _resolve_enable_scope(policy)
+    exec_binds = _executable_ro_binds(argv)
+    if exec_binds:
+        policy = replace(policy, ro_paths=(*policy.ro_paths, *exec_binds))
     return wrap(argv, cwd, policy, env, enable_scope=enable_scope)
 
 
