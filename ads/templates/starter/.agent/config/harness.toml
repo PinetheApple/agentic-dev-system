@@ -15,16 +15,31 @@ cmd = ["claude", "-p"]
 [capabilities]
 flags = ["tools", "allowedtools-cli", "streaming", "json_output"]
 
-# ticket 011: the driver-wrap sandbox (`ads/sandbox.py`) jails a run() call
-# with `bwrap --unshare-net` — an egress-deny network jail. That is FATAL
-# for Claude Code: `claude -p` itself needs network access to reach the
-# Anthropic API, so wrapping it in `--unshare-net` would sever the model
-# call before it ever reaches a tool. The sandbox is designed to contain an
-# *agent's tool subprocesses* (the file edits/shell commands the model
-# asks for), not the LLM-transport CLI that makes the API call in the first
-# place — those are two different trust boundaries that this slice doesn't
-# yet separate (see ticket 011 fog). Leave `enabled = false` here unless
-# you're running a local/offline model, or a harness that natively sandboxes
-# only its own tool-use (see `ads/sandbox.py`'s `SANDBOX_NATIVE_CAPABILITY`).
+# ticket 011: the driver-wrap jail (ads/sandbox.py) contains each run() with a
+# bubblewrap FS jail (rw = the task's worktree only), tmpfs-masked host secrets
+# (~/.ssh, ~/.aws, ~/.gnupg, ~/.config/gh), a scrubbed env (--clearenv + a small
+# allowlist), and cgroup resource caps. `deny_egress = false` KEEPS host network
+# so `claude -p` can reach the Anthropic API — bwrap only drops the network
+# namespace when deny_egress = true (that mode is for local/offline models).
+#
+# Because the jail scrubs env and masks $HOME, claude's own credentials must be
+# handed back in narrowly: rw_paths binds claude's cred/state dir (it reads AND
+# writes session state there) and env_allowlist re-admits the API-key env var if
+# you auth that way. This is a NAMED harness carve-out — ~/.ssh/~/.aws stay masked.
+#
+# Residual (honest): with network allowed AND the claude token readable in-jail,
+# a compromised agent tool could exfiltrate THAT token (payload bounded to it +
+# the worktree — everything else is masked). Closing that needs harness-native
+# tool sandboxing (dec 9, SANDBOX_NATIVE_CAPABILITY) — tracked, not built here.
+# Still strictly stronger than a disabled jail (host FS, secrets, fork-bombs all
+# contained). For maximum isolation, run the whole driver inside a container
+# that has network but no host home.
 [sandbox]
-enabled = false
+enabled = true
+deny_egress = false
+mem_max = "4G"
+cpu_quota = "200%"
+tasks_max = 512
+caps_required = false
+rw_paths = ["~/.claude"]
+env_allowlist = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]

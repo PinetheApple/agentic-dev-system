@@ -80,6 +80,14 @@ class SandboxPolicy:
     deny_egress: bool = True
     ro_paths: tuple[str, ...] = DEFAULT_RO_PATHS
     ro_home_paths: tuple[str, ...] = ()
+    # Extra directories bound READ-WRITE inside the jail, beyond the single
+    # `cwd` worktree bind. This is a narrow, opt-in carve-out for a harness's
+    # own credential/state dir (e.g. `~/.claude`, which `claude -p` both
+    # reads and writes session state to under `--clearenv` + a masked
+    # `$HOME`) — it is NOT for the agent's target files, which already live
+    # under the worktree `cwd` bind. Empty by default; never populated
+    # implicitly.
+    rw_paths: tuple[str, ...] = ()
     mask_paths: tuple[str, ...] = ()
     env_allowlist: tuple[str, ...] = DEFAULT_ENV_ALLOWLIST
     mem_max: str | None = None
@@ -187,6 +195,9 @@ def wrap(
     for path in policy.ro_home_paths:
         if Path(path).exists():
             bwrap_cmd += ["--ro-bind", path, path]
+    for path in policy.rw_paths:
+        if Path(path).exists():
+            bwrap_cmd += ["--bind", path, path]
     if policy.tmpfs_size is not None:
         # bwrap's `--size BYTES` sizes the *next* `--tmpfs` arg and wants a
         # raw byte count, not a human suffix like "2G" — callers must
@@ -289,11 +300,17 @@ def policy_from_harness(harness: HarnessConfig, *, home: Path | None = None) -> 
     expanded_ro_home = tuple(_expand(raw) for raw in ro_home_templates)
     existing_ro_home = tuple(p for p in expanded_ro_home if Path(p).exists())
 
+    # No built-in default here: rw carve-outs beyond the worktree are a
+    # deliberate, named harness opt-in (e.g. `~/.claude`), never implicit.
+    expanded_rw = tuple(_expand(raw) for raw in cfg.rw_paths)
+    existing_rw = tuple(p for p in expanded_rw if Path(p).exists())
+
     return SandboxPolicy(
         enabled=True,
         deny_egress=cfg.deny_egress,
         ro_paths=cfg.ro_paths or DEFAULT_RO_PATHS,
         ro_home_paths=existing_ro_home,
+        rw_paths=existing_rw,
         mask_paths=existing_masks,
         env_allowlist=cfg.env_allowlist or DEFAULT_ENV_ALLOWLIST,
         mem_max=cfg.mem_max,

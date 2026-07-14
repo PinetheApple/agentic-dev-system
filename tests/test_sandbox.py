@@ -139,6 +139,58 @@ class TestWrapEnabled(unittest.TestCase):
         self.assertNotIn("systemd-run", result)
         self.assertEqual(result[0], "bwrap")
 
+    def test_rw_paths_bound_and_ordered_before_mask_tmpfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rw_dir = Path(tmp) / "claude-home"
+            rw_dir.mkdir()
+            policy = sandbox.SandboxPolicy(
+                enabled=True,
+                ro_paths=(),
+                rw_paths=(str(rw_dir), "/does-not-exist-rw"),
+                mask_paths=("/does-not-exist-mask",),
+                env_allowlist=(),
+            )
+
+            result = sandbox.wrap(["true"], _cwd(), policy, {})
+
+            bind_indices = [i for i, v in enumerate(result) if v == "--bind"]
+            bind_pairs = [(result[i + 1], result[i + 2]) for i in bind_indices]
+            self.assertIn((str(rw_dir), str(rw_dir)), bind_pairs)
+            self.assertNotIn(("/does-not-exist-rw", "/does-not-exist-rw"), bind_pairs)
+            self.assertIn((str(_cwd()), str(_cwd())), bind_pairs)
+
+            rw_bind_idx = result.index("--bind")
+            mask_tmpfs_idx = next(
+                i
+                for i in range(len(result))
+                if result[i] == "--tmpfs" and result[i + 1] == "/does-not-exist-mask"
+            )
+            self.assertLess(rw_bind_idx, mask_tmpfs_idx)
+
+    def test_deny_egress_false_keeps_full_fs_jail_and_env_scrub(self) -> None:
+        policy = self._policy(deny_egress=False)
+        env = {"PATH": "/usr/bin", "HOME": "/home/x"}
+
+        result = sandbox.wrap(["true"], _cwd(), policy, env)
+
+        self.assertNotIn("--unshare-net", result)
+        self.assertEqual(result[0], "bwrap")
+        self.assertIn("--clearenv", result)
+        self.assertIn("--bind", result)
+        bind_idx = result.index("--bind")
+        self.assertEqual(result[bind_idx + 1 : bind_idx + 3], [str(_cwd()), str(_cwd())])
+        self.assertIn("--ro-bind", result)
+        self.assertIn("--dev", result)
+        self.assertIn("--proc", result)
+        self.assertIn("--tmpfs", result)
+
+    def test_deny_egress_true_keeps_unshare_net(self) -> None:
+        policy = self._policy(deny_egress=True)
+
+        result = sandbox.wrap(["true"], _cwd(), policy, {})
+
+        self.assertIn("--unshare-net", result)
+
     def test_ro_home_paths_bound_when_existing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp) / "cache"
@@ -363,6 +415,23 @@ class TestPolicyFromHarness(unittest.TestCase):
 
             self.assertEqual(policy.ro_home_paths, (str(home / ".cargo"),))
 
+    def test_rw_paths_expanded_and_existence_filtered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".claude").mkdir()
+            harness = HarnessConfig(
+                tier_model={"fast": "x", "standard": "x", "deep": "x"},
+                run_cmd=[],
+                capabilities=[],
+                sandbox=SandboxConfig(
+                    enabled=True, rw_paths=("~/.claude", "~/.does-not-exist-rw")
+                ),
+            )
+
+            policy = sandbox.policy_from_harness(harness, home=home)
+
+            self.assertEqual(policy.rw_paths, (str(home / ".claude"),))
+
     def test_caps_required_parsed_from_config(self) -> None:
         harness = HarnessConfig(
             tier_model={"fast": "x", "standard": "x", "deep": "x"},
@@ -440,6 +509,7 @@ wall_clock = 600
 tmpfs_size = "1000000"
 ro_paths = ["/usr"]
 ro_home_paths = ["~/.cargo"]
+rw_paths = ["~/.claude"]
 mask_paths = ["/root/.ssh"]
 env_allowlist = ["PATH"]
 caps_required = true
@@ -458,6 +528,7 @@ caps_required = true
             self.assertEqual(harness.sandbox.tmpfs_size, "1000000")
             self.assertEqual(harness.sandbox.ro_paths, ("/usr",))
             self.assertEqual(harness.sandbox.ro_home_paths, ("~/.cargo",))
+            self.assertEqual(harness.sandbox.rw_paths, ("~/.claude",))
             self.assertEqual(harness.sandbox.mask_paths, ("/root/.ssh",))
             self.assertEqual(harness.sandbox.env_allowlist, ("PATH",))
             self.assertTrue(harness.sandbox.caps_required)
@@ -587,6 +658,23 @@ class TestRealBwrapIntegration(unittest.TestCase):
 
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("OK", proc.stdout)
+
+    @unittest.skipUnless(sandbox.is_available(), "bwrap/systemd-run not on PATH")
+    def test_deny_egress_false_jail_still_executes(self) -> None:
+        """Not a real-internet-reachability check — just proves the
+        non-`--unshare-net` jail (FS isolation + env scrub, host network
+        namespace) actually runs under real bwrap."""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            policy = sandbox.SandboxPolicy(enabled=True, deny_egress=False)
+            argv = sandbox.wrap(["/bin/sh", "-c", "echo NET_OK"], cwd, policy, {})
+
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("NET_OK", proc.stdout)
 
 
 if __name__ == "__main__":

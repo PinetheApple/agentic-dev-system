@@ -1,7 +1,8 @@
 """`driver init` scaffolds a claude-code-ready `.agent/config/` into a target
-repo — the anti-footgun regression: sandbox must ship disabled (see
-ads/templates/starter/.agent/config/harness.toml's comment for why enabling
-it would sever `claude -p`'s own API call)."""
+repo — the anti-footgun regression: sandbox must ship ENABLED with network
+allowed (see ads/templates/starter/.agent/config/harness.toml's comment): a
+disabled jail throws away all containment, and `deny_egress = false` (not
+`--unshare-net`) is what keeps `claude -p`'s own API call alive."""
 
 from __future__ import annotations
 
@@ -40,12 +41,15 @@ class TestDriverInit(unittest.TestCase):
         self.assertIn("coder", cfg.experts)
         self.assertEqual(cfg.harness.tier_model["standard"], "claude-sonnet-5")
 
-    def test_scaffolded_harness_toml_has_sandbox_disabled(self) -> None:
+    def test_scaffolded_harness_toml_has_sandbox_enabled_with_network(self) -> None:
         main(["--repo", str(self.repo), "init"])
 
         raw = (self.repo / ".agent" / "config" / "harness.toml").read_bytes()
         with_sandbox = tomllib.loads(raw.decode("utf-8"))
-        self.assertFalse(with_sandbox["sandbox"]["enabled"])
+        sandbox_table = with_sandbox["sandbox"]
+        self.assertTrue(sandbox_table["enabled"])
+        self.assertFalse(sandbox_table["deny_egress"])
+        self.assertIn("~/.claude", sandbox_table["rw_paths"])
 
     def test_second_init_without_force_refuses(self) -> None:
         main(["--repo", str(self.repo), "init"])
