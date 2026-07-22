@@ -228,14 +228,10 @@ class TestWrapEnabled(unittest.TestCase):
             result = sandbox.wrap(["true"], _cwd(), policy, {})
 
             ro_bind_pairs = [
-                (result[i + 1], result[i + 2])
-                for i, v in enumerate(result)
-                if v == "--ro-bind"
+                (result[i + 1], result[i + 2]) for i, v in enumerate(result) if v == "--ro-bind"
             ]
             self.assertIn((str(cache_dir), str(cache_dir)), ro_bind_pairs)
-            self.assertNotIn(
-                ("/does-not-exist-ro-home", "/does-not-exist-ro-home"), ro_bind_pairs
-            )
+            self.assertNotIn(("/does-not-exist-ro-home", "/does-not-exist-ro-home"), ro_bind_pairs)
 
 
 class TestRequire(unittest.TestCase):
@@ -352,9 +348,7 @@ class TestWrapCommand(unittest.TestCase):
 class TestScopeAvailable(unittest.TestCase):
     def test_missing_binary_returns_false(self) -> None:
         sandbox.scope_available.cache_clear()
-        with mock.patch.object(
-            sandbox.subprocess, "run", side_effect=FileNotFoundError
-        ):
+        with mock.patch.object(sandbox.subprocess, "run", side_effect=FileNotFoundError):
             self.assertFalse(sandbox.scope_available())
         sandbox.scope_available.cache_clear()
 
@@ -471,9 +465,7 @@ class TestPolicyFromHarness(unittest.TestCase):
                 tier_model={"fast": "x", "standard": "x", "deep": "x"},
                 run_cmd=[],
                 capabilities=[],
-                sandbox=SandboxConfig(
-                    enabled=True, rw_paths=("~/.claude", "~/.does-not-exist-rw")
-                ),
+                sandbox=SandboxConfig(enabled=True, rw_paths=("~/.claude", "~/.does-not-exist-rw")),
             )
 
             policy = sandbox.policy_from_harness(harness, home=home)

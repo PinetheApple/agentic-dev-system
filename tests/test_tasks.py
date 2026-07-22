@@ -1,134 +1,101 @@
+"""Table-driven unit tests for ticket 003's DAG mechanics: segment-aware
+`owns` overlap and 3-color-DFS acyclicity."""
+
+from __future__ import annotations
+
 import unittest
+from typing import ClassVar
 
 from ads.tasks import (
     CycleError,
-    ExitCriterion,
     Task,
+    TaskParseError,
+    _owns_overlap,  # pyright: ignore[reportPrivateUsage]
     check_acyclic,
-    parse_task,
     ready_batch,
-    serialize_task,
 )
 
 
-class TestFrontmatterRoundTrip(unittest.TestCase):
-    def test_round_trip_stable(self) -> None:
-        task = Task(
-            id="01-implement",
-            status="pending",
-            depends_on=["00-setup"],
-            owns=["ads/foo.py", "ads/bar.py"],
-            exit_criteria=[
-                ExitCriterion(check="cmd", value="pytest tests/test_foo.py"),
-                ExitCriterion(check="judgment", value="follows SOLID"),
-            ],
-            expert="python-expert",
-            critical=True,
-            tier="standard",
-            parent=None,
-            body="Implement the foo module.\n\nHonor the Bar interface.",
-        )
-        text1 = serialize_task(task)
-        parsed1 = parse_task(text1)
-        text2 = serialize_task(parsed1)
-        parsed2 = parse_task(text2)
+class OwnsOverlapTest(unittest.TestCase):
+    CASES: ClassVar[list[tuple[str, list[str], list[str], bool]]] = [
+        ("identical path", ["src/tui"], ["src/tui"], True),
+        ("dir prefixes file", ["src/tui"], ["src/tui/app.py"], True),
+        ("file prefixed by dir", ["src/tui/app.py"], ["src/tui"], True),
+        ("sibling dir with shared string prefix", ["src/tui"], ["src/tui-old"], False),
+        ("disjoint dirs", ["src/a"], ["src/b"], False),
+        ("no overlap, multiple entries", ["src/a", "src/b"], ["src/c", "src/d"], False),
+        ("overlap among many", ["src/a", "src/b"], ["src/b/inner.py"], True),
+        ("empty vs anything", [], ["src/a"], False),
+        ("empty vs empty", [], [], False),
+    ]
 
-        self.assertEqual(text1, text2)
-        self.assertEqual(parsed1, parsed2)
-        self.assertEqual(parsed1.id, "01-implement")
-        self.assertEqual(parsed1.depends_on, ["00-setup"])
-        self.assertEqual(parsed1.owns, ["ads/foo.py", "ads/bar.py"])
-        self.assertEqual(len(parsed1.exit_criteria), 2)
-        self.assertEqual(parsed1.exit_criteria[0].check, "cmd")
-        self.assertTrue(parsed1.critical)
-
-    def test_null_parent_and_empty_lists(self) -> None:
-        task = Task(id="00-setup", status="done", parent=None)
-        parsed = parse_task(serialize_task(task))
-        self.assertIsNone(parsed.parent)
-        self.assertEqual(parsed.depends_on, [])
-        self.assertEqual(parsed.owns, [])
-        self.assertEqual(parsed.exit_criteria, [])
-
-    def test_body_preserved(self) -> None:
-        text = (
-            "---\n"
-            "id: x\n"
-            "status: pending\n"
-            "depends_on: []\n"
-            "owns: []\n"
-            "exit_criteria: []\n"
-            "expert: python-expert\n"
-            "critical: false\n"
-            "tier: fast\n"
-            "parent: null\n"
-            "---\n"
-            "# Objective\n\nDo the thing.\n"
-        )
-        task = parse_task(text)
-        self.assertIn("Do the thing.", task.body)
+    def test_cases(self) -> None:
+        for name, a, b, expected in self.CASES:
+            with self.subTest(name=name):
+                self.assertEqual(_owns_overlap(a, b), expected)
+                self.assertEqual(_owns_overlap(b, a), expected)
 
 
-class TestAcyclicity(unittest.TestCase):
-    def _task(self, task_id: str, depends_on: list[str]) -> Task:
-        return Task(id=task_id, status="pending", depends_on=depends_on)
+def _task(task_id: str, depends_on: list[str] | None = None, owns: list[str] | None = None) -> Task:
+    return Task(id=task_id, depends_on=depends_on or [], owns=owns or [])
 
-    def test_accepts_dag(self) -> None:
+
+class CheckAcyclicTest(unittest.TestCase):
+    def test_dag_passes(self) -> None:
+        tasks = [_task("a"), _task("b", depends_on=["a"]), _task("c", depends_on=["a", "b"])]
+        check_acyclic(tasks)  # no raise
+
+    def test_direct_cycle_raises(self) -> None:
+        tasks = [_task("a", depends_on=["b"]), _task("b", depends_on=["a"])]
+        with self.assertRaises(CycleError):
+            check_acyclic(tasks)
+
+    def test_indirect_cycle_raises(self) -> None:
         tasks = [
-            self._task("a", []),
-            self._task("b", ["a"]),
-            self._task("c", ["a", "b"]),
-        ]
-        check_acyclic(tasks)  # must not raise
-
-    def test_rejects_cycle(self) -> None:
-        tasks = [
-            self._task("a", ["c"]),
-            self._task("b", ["a"]),
-            self._task("c", ["b"]),
+            _task("a", depends_on=["c"]),
+            _task("b", depends_on=["a"]),
+            _task("c", depends_on=["b"]),
         ]
         with self.assertRaises(CycleError):
             check_acyclic(tasks)
 
-    def test_rejects_self_cycle(self) -> None:
-        tasks = [self._task("a", ["a"])]
+    def test_unknown_dependency_raises(self) -> None:
+        tasks = [_task("a", depends_on=["ghost"])]
+        with self.assertRaises(TaskParseError):
+            check_acyclic(tasks)
+
+    def test_self_loop_raises(self) -> None:
+        tasks = [_task("a", depends_on=["a"])]
         with self.assertRaises(CycleError):
             check_acyclic(tasks)
 
 
-class TestReadyBatch(unittest.TestCase):
-    def test_disjoint_owns_batched_together(self) -> None:
-        tasks = [
-            Task(id="a", status="pending", owns=["x.py"]),
-            Task(id="b", status="pending", owns=["y.py"]),
-        ]
-        batch = ready_batch(tasks)
-        self.assertEqual({t.id for t in batch}, {"a", "b"})
+class ReadyBatchTest(unittest.TestCase):
+    def test_orders_by_dependency(self) -> None:
+        tasks = [_task("a", owns=["src/a"]), _task("b", depends_on=["a"], owns=["src/b"])]
+        self.assertEqual([t.id for t in ready_batch(tasks)], ["a"])
 
-    def test_overlapping_owns_only_one_batched(self) -> None:
+    def test_batches_disjoint_owns_but_not_overlapping(self) -> None:
         tasks = [
-            Task(id="a", status="pending", owns=["shared.py"]),
-            Task(id="b", status="pending", owns=["shared.py"]),
+            _task("a", owns=["src/tui"]),
+            _task("b", owns=["src/tui/app.py"]),
+            _task("c", owns=["src/other"]),
         ]
-        batch = ready_batch(tasks)
-        self.assertEqual(len(batch), 1)
+        batch_ids = [t.id for t in ready_batch(tasks)]
+        self.assertIn("a", batch_ids)
+        self.assertIn("c", batch_ids)
+        self.assertNotIn("b", batch_ids)
 
-    def test_deps_gate_readiness(self) -> None:
-        tasks = [
-            Task(id="a", status="pending", owns=["a.py"]),
-            Task(id="b", status="pending", owns=["b.py"], depends_on=["a"]),
-        ]
-        batch = ready_batch(tasks)
-        self.assertEqual({t.id for t in batch}, {"a"})
+    def test_done_deps_unblock_dependents(self) -> None:
+        a = _task("a", owns=["src/a"])
+        a.status = "done"
+        b = _task("b", depends_on=["a"], owns=["src/b"])
+        self.assertEqual([t.id for t in ready_batch([a, b])], ["b"])
 
-    def test_done_and_active_excluded(self) -> None:
-        tasks = [
-            Task(id="a", status="done", owns=["a.py"]),
-            Task(id="b", status="pending", owns=["b.py"], depends_on=["a"]),
-            Task(id="c", status="active", owns=["c.py"]),
-        ]
-        batch = ready_batch(tasks)
-        self.assertEqual({t.id for t in batch}, {"b"})
+    def test_unknown_dependency_raises(self) -> None:
+        tasks = [_task("a", depends_on=["ghost"])]
+        with self.assertRaises(TaskParseError):
+            ready_batch(tasks)
 
 
 if __name__ == "__main__":

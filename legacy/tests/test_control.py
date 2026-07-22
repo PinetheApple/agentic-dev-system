@@ -191,9 +191,7 @@ class TestDriverAbort(DriverIntegrationTestCase):
         self._drive_to_dispatch()
         state = load_state(self.layout)
         critical_task_id = next(iter(state.tasks))
-        control.enqueue(
-            self.layout, control.ControlCommand(verb="abort", task_id=critical_task_id)
-        )
+        control.enqueue(self.layout, control.ControlCommand(verb="abort", task_id=critical_task_id))
 
         state = run_until_halt(self.layout, self.cfg, self.adapter)
         self.assertEqual(state.tasks[critical_task_id], "aborted")
@@ -223,9 +221,7 @@ class TestControlCLI(unittest.TestCase):
         start_run(self.layout, "Build a thing.")
 
     def test_pause_cli_writes_control_log_and_prints_status(self) -> None:
-        exit_code = cli.main(
-            ["--repo", str(self.repo), "--run-id", "run-test", "pause"]
-        )
+        exit_code = cli.main(["--repo", str(self.repo), "--run-id", "run-test", "pause"])
         self.assertEqual(exit_code, 0)
         lines = self.layout.control_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 1)

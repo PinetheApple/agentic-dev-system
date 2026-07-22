@@ -197,9 +197,7 @@ def build_detail_frame(
 # ---------------------------------------------------------------------------
 
 
-def _read_scratch_tail(
-    layout: RunLayout, task_id: str, *, max_lines: int = 40
-) -> tuple[str, ...]:
+def _read_scratch_tail(layout: RunLayout, task_id: str, *, max_lines: int = 40) -> tuple[str, ...]:
     """Last `max_lines` of `scratch/<task_id>.md`. Read-only, bounded — never
     the whole transcript. `()` if the file doesn't exist."""
     path = layout.scratch_dir / f"{task_id}.md"
@@ -209,9 +207,7 @@ def _read_scratch_tail(
     return tuple(lines[-max_lines:])
 
 
-def _read_activity_tail(
-    layout: RunLayout, label: str, *, max_lines: int = 40
-) -> tuple[str, ...]:
+def _read_activity_tail(layout: RunLayout, label: str, *, max_lines: int = 40) -> tuple[str, ...]:
     """Last `max_lines` of `activity/<label>.log` — the drilled-into task's
     own live/streamed harness output. Read-only, bounded. `()` if the file
     doesn't exist (task hasn't run yet, or isn't the one currently active)."""

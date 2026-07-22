@@ -15,13 +15,25 @@ from ads._literal import validate_literal
 
 FRONTMATTER_DELIM = "---"
 
-TaskStatus = Literal["pending", "active", "done", "failed"]
+TaskStatus = Literal["pending", "active", "done", "split", "blocked", "needs-escalation", "aborted"]
+TaskTier = Literal["fast", "standard", "deep"]
 ExitCriterionCheck = Literal["cmd", "judgment"]
 
 TASK_STATUSES: tuple[TaskStatus, ...] = get_args(TaskStatus)
+TASK_TIERS: tuple[TaskTier, ...] = get_args(TaskTier)
 EXIT_CRITERION_CHECKS: tuple[ExitCriterionCheck, ...] = get_args(ExitCriterionCheck)
 
-FRONTMATTER_KEYS = ("id", "status", "depends_on", "owns", "exit_criteria")
+FRONTMATTER_KEYS = (
+    "id",
+    "status",
+    "depends_on",
+    "owns",
+    "exit_criteria",
+    "expert",
+    "critical",
+    "tier",
+    "parent",
+)
 
 # The value shape this hand-rolled parser can ever produce for one frontmatter
 # key: a plain scalar, a flow list of strings, or a block list of flow-maps
@@ -53,6 +65,10 @@ class Task:
     depends_on: list[str] = field(default_factory=list[str])
     owns: list[str] = field(default_factory=list[str])
     exit_criteria: list[ExitCriterion] = field(default_factory=list[ExitCriterion])
+    expert: str = ""
+    critical: bool = False
+    tier: TaskTier = "standard"
+    parent: str | None = None
     body: str = ""
 
 
@@ -192,6 +208,19 @@ def _require_str(data: dict[str, FrontmatterValue], key: str) -> str:
     return value
 
 
+def _optional_str(value: FrontmatterValue) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    raise TaskParseError(f"expected a string or null, got {value!r}")
+
+
+def _str_or_default(value: FrontmatterValue, default: str) -> str:
+    """Like `value or default`, but type-safe: an empty scalar (`key:` with
+    nothing after it) parses as `[]` in this frontmatter shape, so a bare
+    truthiness check is what the original parser relied on here."""
+    return value if isinstance(value, str) and value else default
+
+
 def _as_str_list(value: FrontmatterValue) -> list[str]:
     if value is None:
         return []
@@ -233,14 +262,30 @@ def parse_task(text: str) -> Task:
         TaskStatus,
         validate_literal(data["status"], TASK_STATUSES, field="status", error=TaskParseError),
     )
+    tier_value = data.get("tier") or "standard"
+    tier = cast(
+        TaskTier, validate_literal(tier_value, TASK_TIERS, field="tier", error=TaskParseError)
+    )
     return Task(
         id=_require_str(data, "id"),
         status=status,
         depends_on=_as_str_list(data.get("depends_on")),
         owns=_as_str_list(data.get("owns")),
         exit_criteria=_parse_exit_criteria(data.get("exit_criteria")),
+        expert=_str_or_default(data.get("expert"), ""),
+        critical=bool(data.get("critical") or False),
+        tier=tier,
+        parent=_optional_str(data.get("parent")),
         body=body,
     )
+
+
+def _fmt_scalar(value: str | bool | None) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _fmt_flow_list(items: list[str]) -> str:
@@ -259,6 +304,10 @@ def serialize_task(task: Task) -> str:
             lines.append(f'  - {{check: {ec.check}, value: "{ec.value}"}}')
     else:
         lines.append("exit_criteria: []")
+    lines.append(f"expert: {task.expert}")
+    lines.append(f"critical: {_fmt_scalar(task.critical)}")
+    lines.append(f"tier: {task.tier}")
+    lines.append(f"parent: {_fmt_scalar(task.parent)}")
     lines.append(FRONTMATTER_DELIM)
     front = "\n".join(lines)
     if task.body:
@@ -267,17 +316,12 @@ def serialize_task(task: Task) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DAG checks + concurrency (the parallelism seam, ticket 003)
+# DAG checks + concurrency
 # ---------------------------------------------------------------------------
 
 
 def check_acyclic(tasks: list[Task]) -> None:
-    """Raise CycleError/TaskParseError if depends_on edges are not a DAG.
-
-    One 3-color DFS pass catches both a cycle (with the cycle path) and a
-    `depends_on` referencing an unknown task id. Runs once as the plan-commit
-    gate, before any task file is written.
-    """
+    """Raise CycleError if depends_on edges form a cycle."""
     by_id = {t.id: t for t in tasks}
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {t.id: WHITE for t in tasks}
@@ -299,41 +343,22 @@ def check_acyclic(tasks: list[Task]) -> None:
             visit(t.id, [t.id])
 
 
-def _path_segments(path: str) -> list[str]:
-    return [seg for seg in path.split("/") if seg]
-
-
-def _is_segment_prefix(a: list[str], b: list[str]) -> bool:
-    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    return shorter == longer[: len(shorter)]
-
-
 def _owns_overlap(a: list[str], b: list[str]) -> bool:
-    """Two `owns` entries overlap iff one is a segment-aware path prefix of the
-    other: `src/tui` overlaps `src/tui/app.py` but not `src/tui-old` (a plain
-    string-prefix test would wrongly match the latter)."""
-    for path_a in a:
-        segs_a = _path_segments(path_a)
-        for path_b in b:
-            if _is_segment_prefix(segs_a, _path_segments(path_b)):
-                return True
-    return False
+    return bool(set(a) & set(b))
 
 
 def ready_batch(tasks: list[Task]) -> list[Task]:
     """Pending tasks whose deps are all done, greedily filtered to disjoint `owns`.
 
     Concurrency is derived from disjoint `owns`, not a declared flag: two ready
-    tasks that touch overlapping paths cannot be batched together. Kept as the
-    full batch computation even though the serial executor only ever consumes
-    `ready_batch(...)[0]` — this is the parallelism seam (ticket 003).
+    tasks that touch overlapping paths cannot be batched together.
+
+    Ticket 010: `aborted` is terminal and never `pending`, so an aborted task
+    is naturally excluded here; a dependent of an aborted task also never
+    becomes ready because its `depends_on` id never reaches `done` — abort
+    blocks dependents by construction, no extra bookkeeping needed.
     """
-    by_id = {t.id: t for t in tasks}
     done_ids = {t.id for t in tasks if t.status == "done"}
-    for t in tasks:
-        for dep in t.depends_on:
-            if dep not in by_id:
-                raise TaskParseError(f"{t.id} depends_on unknown task {dep!r}")
     dep_ready = [
         t for t in tasks if t.status == "pending" and all(dep in done_ids for dep in t.depends_on)
     ]

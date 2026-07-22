@@ -62,9 +62,7 @@ class _FixingAdapter:
     ) -> RunResult:
         self.calls.append(cwd)
         (cwd / self.offending_relpath).unlink(missing_ok=True)
-        return RunResult(
-            text='{"status": "done"}', structured={"status": "done"}, exit_status="ok"
-        )
+        return RunResult(text='{"status": "done"}', structured={"status": "done"}, exit_status="ok")
 
 
 class _NoOpAdapter:
@@ -93,9 +91,7 @@ class _NoOpAdapter:
         activity_log: Path | None = None,
     ) -> RunResult:
         self.calls += 1
-        return RunResult(
-            text='{"status": "done"}', structured={"status": "done"}, exit_status="ok"
-        )
+        return RunResult(text='{"status": "done"}', structured={"status": "done"}, exit_status="ok")
 
 
 class _NeverCalledAdapter:

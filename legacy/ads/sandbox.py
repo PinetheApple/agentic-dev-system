@@ -132,7 +132,7 @@ def scope_available() -> bool:
             capture_output=True,
             timeout=_SCOPE_PROBE_TIMEOUT_SECONDS,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError, subprocess.TimeoutExpired:
         return False
     return proc.returncode == 0
 
@@ -375,9 +375,7 @@ _RM_RF_RE = re.compile(r"\brm\s+(?:-\S+\s+)*-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(\S
 _RM_FR_RE = re.compile(r"\brm\s+(?:-\S+\s+)*-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\s+(\S+)")
 _FORK_BOMB_RE = re.compile(r":\s*\(\)\s*{\s*:\s*\|\s*:\s*&?\s*}\s*;\s*:")
 _PIPE_TO_SHELL_RE = re.compile(r"\b(curl|wget)\b[^|;]*\|\s*(sudo\s+)?(sh|bash|zsh)\b")
-_BASE64_TO_SHELL_RE = re.compile(
-    r"base64\b[^|;]*(-d|--decode)[^|;]*\|\s*(sudo\s+)?(sh|bash|zsh)\b"
-)
+_BASE64_TO_SHELL_RE = re.compile(r"base64\b[^|;]*(-d|--decode)[^|;]*\|\s*(sudo\s+)?(sh|bash|zsh)\b")
 _ECHO_TO_SHELL_RE = re.compile(r"\becho\b[^|;]*\|\s*(sudo\s+)?(sh|bash|zsh|base64)\b")
 _HIGH_ENTROPY_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"

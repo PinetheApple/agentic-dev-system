@@ -1,8 +1,22 @@
-"""Run state: the ONLY thing the driver loop reads to decide what to do next.
+"""Run state (ticket 002 + 005): the ONLY thing the driver loop reads to
+decide what to do next. `state.json` is written atomically (temp file +
+`os.replace`) so a crash never leaves a half-written file. `events.jsonl` is
+an append-only audit trail the loop never reads back.
 
-`state.json` is written atomically (temp file + os.replace) so a crash never
-leaves a half-written file. `events.jsonl` is an append-only audit trail the
-loop never reads back — it exists for humans/debugging only.
+**Halt-state encoding (ticket 006).** There is no dedicated "halt-state"
+field; halts are expressed as combinations of the 11 fields below, and
+`describe_halt` derives the CLI-facing label from them:
+
+- `awaiting_plan_approval`   — `phase="review"`, `review_stage=None`.
+- `awaiting_spec_approval`   — `phase="review"`, `review_stage="spec"`.
+- `awaiting_design_approval` — `phase="review"`, `review_stage="design"`.
+- `awaiting_clarification`   — `phase="plan"`, `question is not None`.
+- `awaiting_signoff`         — `phase="validate"`, `cursor=None`, every task
+  `done` (the full graph validated but the user hasn't signed off yet — the
+  loop has no code path that writes `done` itself, ticket 006).
+- `blocked`                  — `gate="blocked"` (cyclic plan, ceiling hit).
+
+`done` is terminal and carries no halt label.
 """
 
 from __future__ import annotations
@@ -13,20 +27,23 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, cast, get_args
 
 from ads._literal import validate_literal
-from ads.adapters.base import ADAPTER_CLAUDE_CODE, AdapterName
+from ads.adapters.base import ADAPTER_STUB, AdapterName
 from ads.layout import RunLayout
 from ads.tasks import TaskStatus
 
-Phase = Literal["intake", "plan", "review", "dispatch", "validate", "done"]
+Phase = Literal["intake", "plan", "review", "execute", "validate", "done"]
 ReviewStage = Literal["spec", "design"]
-Gate = Literal["pending", "blocked", "reconcile", "escalation", "paused"]
-ReplanScope = Literal["design"]
+Gate = Literal["blocked"]
 
 PHASES: tuple[Phase, ...] = get_args(Phase)
 REVIEW_STAGES: tuple[ReviewStage, ...] = get_args(ReviewStage)
 GATES: tuple[Gate, ...] = get_args(Gate)
 
-DEFAULT_ADAPTER: AdapterName = ADAPTER_CLAUDE_CODE
+DEFAULT_ADAPTER: AdapterName = ADAPTER_STUB
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 @dataclass
@@ -35,49 +52,13 @@ class State:
     review_stage: ReviewStage | None = None
     gate: Gate | None = None
     tasks: dict[str, TaskStatus] = field(default_factory=dict[str, TaskStatus])
-    retry_counts: dict[str, int] = field(default_factory=dict[str, int])
-    # Ticket 005 Rule 5: machine-owned dispatch-attempt counter per task id,
-    # the portable budget-ceiling floor (ads/resplit.py's STEP_CEILING).
-    # Survives crash since it's part of the atomically-written state.json.
-    step_counts: dict[str, int] = field(default_factory=dict[str, int])
-    # Ticket 011 dec 6 + dec 7: the open-set cursor for the escalation gate —
-    # request id -> "pending"|"approved"|"rejected". Bodies (reason/exact
-    # payload) live on disk under `escalations_dir`; this is only the status
-    # the loop reads to decide whether the gate is still open.
-    escalations: dict[str, str] = field(default_factory=dict[str, str])
-    # Exact `cmd` strings a human has approved via a cmd-flagged escalation,
-    # so `escalation.screen_cmd` skips them on re-dispatch instead of
-    # re-flagging and re-halting the same approved command forever.
-    approved_cmds: list[str] = field(default_factory=list[str])
+    attempts: dict[str, int] = field(default_factory=dict[str, int])
     cursor: str | None = None
     halt_reason: str | None = None
-    # None = full (re)plan; "design" = spec.md is frozen-approved, only
-    # regenerate design.md + tasks (freeze-approved-upstream, ticket 008).
-    replan_scope: ReplanScope | None = None
-    # Harness adapter this run was started with. Persisted so later commands
-    # (approve/resume) can't silently switch harness mid-run.
     adapter: AdapterName = DEFAULT_ADAPTER
     updated_at: str = ""
-    # Ticket 010: whether a foreground driver process currently holds this
-    # run (a human is attached, in the sync-block sense). Set by a
-    # foreground drive; false on detached/resume/crash — a later concern,
-    # just the field + round-trip here.
-    attached: bool = False
-    # Ticket 010: operator-requested pause, drained from control.jsonl at a
-    # unit boundary. Distinct from `gate` so pause/resume can toggle without
-    # touching the phase-gate machinery; the driver halts to gate="paused"
-    # when this is True and clears that gate when a drained `resume` flips
-    # it back to False.
-    paused: bool = False
-    # Ticket 010: machine-owned cursor over control.jsonl — count of control
-    # commands already drained, same spirit as `step_counts`.
-    control_cursor: int = 0
-    # Observability heartbeat: set the instant a long-running `adapter.run()`
-    # begins, cleared when it ends (`ads/activity.py`'s `run_with_activity`
-    # is the single choke point that sets/clears this). A plain dict, not a
-    # dataclass, so state.json serialization stays trivial — keys: `label`,
-    # `kind`, `model`, `started_at` (iso8601 Z).
-    current_activity: dict[str, str] | None = None
+    event_seq: int = 0
+    question: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,7 +70,6 @@ class State:
         `Any` here is the boundary, not a leak into the rest of the module."""
         gate = data.get("gate")
         review_stage = data.get("review_stage")
-        replan_scope = data.get("replan_scope")
         return cls(
             phase=cast(Phase, validate_literal(data.get("phase", "intake"), PHASES, field="phase")),
             review_stage=cast(
@@ -101,18 +81,9 @@ class State:
             if gate is not None
             else None,
             tasks=dict(data.get("tasks", {})),
-            retry_counts=dict(data.get("retry_counts", {})),
-            step_counts=dict(data.get("step_counts", {})),
-            escalations=dict(data.get("escalations", {})),
-            approved_cmds=list(data.get("approved_cmds", [])),
+            attempts=dict(data.get("attempts", {})),
             cursor=data.get("cursor"),
             halt_reason=data.get("halt_reason"),
-            replan_scope=cast(
-                ReplanScope,
-                validate_literal(replan_scope, get_args(ReplanScope), field="replan_scope"),
-            )
-            if replan_scope is not None
-            else None,
             adapter=cast(
                 AdapterName,
                 validate_literal(
@@ -120,12 +91,8 @@ class State:
                 ),
             ),
             updated_at=data.get("updated_at", ""),
-            attached=bool(data.get("attached", False)),
-            paused=bool(data.get("paused", False)),
-            control_cursor=int(data.get("control_cursor", 0)),
-            current_activity=dict(data["current_activity"])
-            if data.get("current_activity") is not None
-            else None,
+            event_seq=int(data.get("event_seq", 0)),
+            question=data.get("question"),
         )
 
 
@@ -136,8 +103,8 @@ def load_state(layout: RunLayout) -> State:
 
 def save_state(layout: RunLayout, state: State) -> None:
     """Atomic write: write to a sibling temp file, then atomically replace
-    (Path.replace maps to os.replace — atomic same-filesystem rename)."""
-    state.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    (`os.replace` is an atomic same-filesystem rename)."""
+    state.updated_at = _now()
     layout.root.mkdir(parents=True, exist_ok=True)
     tmp_path = layout.state_file.with_suffix(".json.tmp")
     with tmp_path.open("w", encoding="utf-8") as fh:
@@ -146,24 +113,68 @@ def save_state(layout: RunLayout, state: State) -> None:
     tmp_path.replace(layout.state_file)
 
 
-def append_event(layout: RunLayout, kind: str, **payload: Any) -> None:
-    """Append one audit line. Never read by the loop — best-effort only."""
-    layout.root.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# events.jsonl — append-only, never read back by the loop.
+#
+# Documented core kinds/types (ticket 002 §5 + ticket 005 §3, open to grow):
+# run:start, phase:enter, intent, plan_ready/plan:done, gate_open/review:gate,
+# gate_close, task:start, task:done/task_handoff, validate/validate:verdict,
+# activity, halt, done, gap_decided, error.
+# ---------------------------------------------------------------------------
+
+
+def append_event(
+    layout: RunLayout,
+    state: State,
+    event_type: str,
+    *,
+    task: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> int:
+    """Append one feed-envelope line `{ts, seq, phase, type, task, data}` and
+    bump `state.event_seq` in lockstep (persisted by the caller's next
+    `save_state`) so `seq` stays monotonic and gap-free across resumes."""
+    state.event_seq += 1
     event = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "kind": kind,
-        **payload,
+        "ts": _now(),
+        "seq": state.event_seq,
+        "phase": state.phase,
+        "type": event_type,
+        "task": task,
+        "data": data or {},
     }
+    layout.root.mkdir(parents=True, exist_ok=True)
     with layout.events.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, sort_keys=True) + "\n")
+    return state.event_seq
 
 
-def halt(layout: RunLayout, state: State, reason: str, gate: Gate = "blocked") -> State:
-    """Shared halt helper: every phase runner (plan/dispatch/validate) stops
-    the loop the same way, whether the gate is a plain `blocked` or the
-    `reconcile` gate a worktree merge tripwire raises (ticket 006)."""
-    state.gate = gate
+def halt(layout: RunLayout, state: State, reason: str) -> State:
+    """Shared halt helper: any phase runner stops the loop the same way."""
+    state.gate = "blocked"
     state.halt_reason = reason
+    append_event(layout, state, "halt", data={"reason": reason})
     save_state(layout, state)
-    append_event(layout, "halt", reason=reason, gate=gate)
     return state
+
+
+def describe_halt(state: State) -> str | None:
+    """The CLI-facing halt-state label `status`/`approve` reason about."""
+    if state.gate == "blocked":
+        return "blocked"
+    if state.phase == "plan" and state.question is not None:
+        return "awaiting_clarification"
+    if state.phase == "review":
+        if state.review_stage == "spec":
+            return "awaiting_spec_approval"
+        if state.review_stage == "design":
+            return "awaiting_design_approval"
+        return "awaiting_plan_approval"
+    if (
+        state.phase == "validate"
+        and state.cursor is None
+        and state.tasks
+        and all(status == "done" for status in state.tasks.values())
+    ):
+        return "awaiting_signoff"
+    return None

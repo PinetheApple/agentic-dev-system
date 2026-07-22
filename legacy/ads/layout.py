@@ -1,4 +1,4 @@
-"""On-disk layout for a run — the filesystem IS the state (ticket 002)."""
+"""On-disk layout for a run — the filesystem IS the state (spine B, ticket 001)."""
 
 from __future__ import annotations
 
@@ -54,8 +54,20 @@ class RunLayout:
         return self.root / "scratch"
 
     @property
+    def activity_dir(self) -> Path:
+        return self.root / "activity"
+
+    @property
+    def escalations_dir(self) -> Path:
+        return self.root / "escalations"
+
+    @property
     def events(self) -> Path:
         return self.root / "events.jsonl"
+
+    @property
+    def control_log(self) -> Path:
+        return self.root / "control.jsonl"
 
     @property
     def current_link(self) -> Path:
@@ -65,3 +77,15 @@ class RunLayout:
         """Create the run directory tree. Idempotent."""
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        self.escalations_dir.mkdir(parents=True, exist_ok=True)
+        self.activity_dir.mkdir(parents=True, exist_ok=True)
+
+    def link_current(self) -> None:
+        """Point `runs/current` -> this run (best-effort symlink)."""
+        link = self.current_link
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(Path(self.run_id))
+        except OSError:
+            pass  # non-fatal: symlink is a convenience, state.json is truth

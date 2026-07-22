@@ -124,3 +124,8 @@ specified** once the green spine proves out:
 Zero-runtime-dependency stdlib Python; pyright-strict + ruff clean; files
 ≤400–500 lines; minimal comments; `uv` for dev deps; stdlib `unittest` for the
 token-free suite.
+
+**One blessed exception (#005):** the observability feed may depend on `rich` for
+its pinned live-ticking footer — a well-tested lib beats a hand-rolled TUI for a
+core pillar (invariant #7). Per-line tags stay raw ANSI; everything else stays
+stdlib-only.

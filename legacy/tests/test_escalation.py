@@ -347,9 +347,7 @@ class TestEscalationCli(unittest.TestCase):
         self.assertEqual(escalation.list_open(state), [self.request_id])
 
     def test_escalate_approve_resumes_task(self) -> None:
-        exit_code = cli.main(
-            self._argv("escalate-approve", self.request_id, "--no-continue")
-        )
+        exit_code = cli.main(self._argv("escalate-approve", self.request_id, "--no-continue"))
         self.assertEqual(exit_code, 0)
 
         state = load_state(self.layout)

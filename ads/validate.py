@@ -1,63 +1,21 @@
-"""Validation mechanics (ticket 007) + the 006+007 integration follow-up: a
-task never merges dirty. Three gates, all author-agnostic and forgery-proof:
-
-1. **`cmd` gate** — a driver-executed subprocess; the real exit code is the
-   verdict. Runs at an explicit, caller-supplied `cwd` (`_run_cmd_criterion`)
-   — the task's live worktree pre-merge (`ads/dispatch.py`), or the target
-   repo for the in-place fallback.
-2. **`judgment` gate** — a fresh, cold critic `run()` given spec.md + an
-   explicit, caller-supplied diff (`_run_judgment_criterion`) — never the
-   author's scratch/self-summary. Output is a structured `{pass, evidence,
-   cited_paths}` verdict; a `pass: true` with empty `cited_paths` is
-   auto-failed here, not left to the critic's honor (`_parse_verdict`).
-3. **integration critic** — one extra critic `run()` over the whole
-   `spec.md` + the full merged run diff (`resume.owns_diff(repo, ["."])`,
-   ticket 005's root-commit-to-worktree ground truth), run once after every
-   task's own gates have already passed pre-merge and before the run reaches
-   `done`. Catches cross-task seam gaps no single task's own gate would see.
-   This is the one gate that is deliberately still post-merge — it needs
-   every task merged to see cross-task seams.
-
-Per-task gates now run pre-merge, in `ads/dispatch.py`, via the public
-`evaluate_task_at(..., cwd=..., diff_text=...)` entry point below: this
-module remains the home of the gate MECHANICS (criteria evaluation, verdict
-parsing, feedback/report writing); only the call site — and the cwd/diff it
-threads through — moved to before `merge_task_branch`. `ads/driver.py` owns
-the retry-bounded state machine around the post-merge integration critic
-only (write feedback, reset attributed tasks to pending, loop back to
-`dispatch`, halt after 2 rounds); this module only evaluates
-criteria/verdicts and writes the audit trail (`validation-report.md`).
+"""Validation mechanics (ticket 004): two author-agnostic gates per leaf task,
+a driver-run `cmd` and a cold-critic `judgment`, with structural anti-forgery.
+No agent self-report ever counts as done.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ads import resume as resume_module
-from ads import sandbox, worktree
-from ads.activity import run_with_activity
-from ads.adapters.base import Adapter, RunResult
-from ads.config import Config
+from ads.adapters.base import Adapter
 from ads.layout import RunLayout
-from ads.prompt import compose
-from ads.sandbox import SandboxPolicy
-from ads.state import State
-from ads.tasks import ExitCriterion, ExitCriterionCheck, Task
+from ads.phase_json import parse_judgment_verdict
+from ads.task_io import append_scratch
+from ads.tasks import ExitCriterion, ExitCriterionCheck, Task, TaskParseError
 
 CMD_TIMEOUT_SECONDS = 300
-CODE_REVIEW_CAPABILITY = "code-review"
-REPORT_FILENAME = "validation-report.md"
-_DISABLED_SANDBOX_POLICY = SandboxPolicy(enabled=False)
-
-CODE_REVIEW_INSTRUCTION = (
-    "This harness advertises a `code-review` capability — drive that skill "
-    "to review the diff below, then translate its findings into the exact "
-    "JSON verdict contract required here. Where no such skill is available, "
-    "the structured-verdict instructions below are the mandatory floor."
-)
 
 
 @dataclass(frozen=True)
@@ -79,93 +37,48 @@ class TaskValidation:
         return all(r.passed for r in self.results)
 
 
-@dataclass(frozen=True)
-class IntegrationVerdict:
-    passed: bool
-    evidence: str
-    cited_paths: list[str]
+def check_leaf_judgment(tasks: list[Task]) -> None:
+    """Plan-commit gate: every task must carry >=1 `judgment` criterion — makes
+    the "AND a cold critic" rule of the validation gate non-optional."""
+    for task in tasks:
+        if not any(c.check == "judgment" for c in task.exit_criteria):
+            raise TaskParseError(f"{task.id!r} has no judgment exit_criteria (>=1 required)")
 
 
-# ---------------------------------------------------------------------------
-# per-leaf evaluation
-# ---------------------------------------------------------------------------
+def owns_diff(repo: Path, baseline: str, owns: list[str]) -> str:
+    """`git diff <baseline> -- <owns paths>` text, handed to the cold critic
+    as the only evidence of what a task actually changed.
 
-
-def evaluate_task_at(
-    layout: RunLayout,
-    cfg: Config,
-    adapter: Adapter,
-    task: Task,
-    *,
-    cwd: Path,
-    diff_text: str,
-    policy: SandboxPolicy = _DISABLED_SANDBOX_POLICY,
-    state: State | None = None,
-) -> TaskValidation:
-    """Evaluate `task`'s exit criteria at an explicit `cwd` (for `cmd`
-    criteria) and `diff_text` (for `judgment` criteria) — both supplied by
-    the caller rather than self-computed, so this works identically whether
-    called pre-merge from a live worktree (`ads/dispatch.py`) or from the
-    in-place, non-git fallback. `policy` jails the `cmd` gate (ticket 011);
-    it defaults to disabled so existing callers/tests are unaffected.
-    `state` is optional (observability heartbeat, see `ads/activity.py`) —
-    when omitted, the judgment critic calls `adapter.run()` directly exactly
-    as before, so existing callers/tests are unaffected."""
-    results = [
-        _evaluate_criterion(
-            layout,
-            cfg,
-            adapter,
-            task,
-            criterion,
-            cwd=cwd,
-            diff_text=diff_text,
-            policy=policy,
-            state=state,
-        )
-        for criterion in task.exit_criteria
-    ]
-    return TaskValidation(task=task, results=results)
-
-
-def _evaluate_criterion(
-    layout: RunLayout,
-    cfg: Config,
-    adapter: Adapter,
-    task: Task,
-    criterion: ExitCriterion,
-    *,
-    cwd: Path,
-    diff_text: str,
-    policy: SandboxPolicy,
-    state: State | None,
-) -> CriterionResult:
-    if criterion.check == "cmd":
-        return _run_cmd_criterion(cwd, criterion, policy)
-    return _run_judgment_criterion(
-        layout, cfg, adapter, task, criterion, diff_text=diff_text, state=state
+    A task's `owns` paths are commonly brand-new files, and `git diff` never
+    shows an untracked file as an addition — so mark them intent-to-add first
+    (`git add -N`: registers the path without staging its content) so a new
+    file shows up as a real diff hunk instead of silently disappearing.
+    """
+    if not owns:
+        return ""
+    subprocess.run(
+        ["git", "add", "-N", "--", *owns], cwd=repo, capture_output=True, text=True, check=False
     )
+    proc = subprocess.run(
+        ["git", "diff", baseline, "--", *owns],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.stdout
 
 
-def _run_cmd_criterion(
-    cwd: Path, criterion: ExitCriterion, policy: SandboxPolicy
-) -> CriterionResult:
-    sandbox.require(policy)  # fail-closed
-    env = sandbox.resolve_env(policy, os.environ)
-    argv, use_shell = sandbox.wrap_shell(criterion.value, cwd, policy, env)
-
-    # dec 7 routing now lives upstream, before this function is ever called:
-    # ads/dispatch.py's `_gate_and_route` screens every `cmd` criterion via
-    # `ads/escalation.py`'s `screen_cmd` and routes a flagged, not-yet-
-    # approved command to human escalation instead of reaching here at all.
+def _run_cmd_criterion(cwd: Path, criterion: ExitCriterion) -> CriterionResult:
     try:
         proc = subprocess.run(
-            argv,
-            shell=use_shell,
+            criterion.value,
+            shell=True,
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=CMD_TIMEOUT_SECONDS,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         detail = f"timed out after {CMD_TIMEOUT_SECONDS}s: {criterion.value!r}"
@@ -176,126 +89,50 @@ def _run_cmd_criterion(
     )
 
 
+def _judgment_prompt(spec_text: str, diff_text: str, assertion: str) -> str:
+    return (
+        "## Spec\n\n"
+        f"{spec_text.strip()}\n\n"
+        "## Owns-diff\n\n"
+        f"{diff_text.strip()}\n\n"
+        "## Assertion to verify\n\n"
+        f"{assertion}\n\n"
+        "Respond with a bare JSON object: "
+        '{"pass": bool, "evidence": str, "cited_paths": [str, ...]}. '
+        "`cited_paths` must be paths that literally appear in the owns-diff above."
+    )
+
+
 def _run_judgment_criterion(
-    layout: RunLayout,
-    cfg: Config,
-    adapter: Adapter,
-    task: Task,
-    criterion: ExitCriterion,
-    *,
-    diff_text: str,
-    state: State | None = None,
+    adapter: Adapter, cwd: Path, criterion: ExitCriterion, *, spec_text: str, diff_text: str
 ) -> CriterionResult:
-    task_body = (
-        cfg.phases["validate"]
-        .body.replace("{criterion}", criterion.value)
-        .replace(
-            "{diff}",
-            diff_text or "(no diff: nothing changed under this task's declared `owns` paths)",
-        )
-    )
-    result = _run_critic(layout, cfg, adapter, task_body, label=f"{task.id}-judgment", state=state)
-    passed, evidence, cited = _parse_verdict(result)
+    prompt = _judgment_prompt(spec_text, diff_text, criterion.value)
+    result = adapter.run(prompt, cwd, role="validation")
+    verdict = parse_judgment_verdict(result.text)
+    passed = verdict["pass"]
+    evidence = verdict["evidence"]
+    cited_paths = verdict["cited_paths"]
+
+    # Anti-rubber-stamp, structural not honor-based (ticket 004).
+    if passed and not cited_paths:
+        passed = False
+        evidence = f"AUTO-FAIL: pass:true with empty cited_paths ({evidence})"
+    elif passed:
+        hallucinated = [p for p in cited_paths if p not in diff_text]
+        if hallucinated:
+            passed = False
+            evidence = f"AUTO-FAIL: cited_paths not in owns-diff {hallucinated} ({evidence})"
+
     return CriterionResult(
-        check="judgment", value=criterion.value, passed=passed, detail=evidence, cited_paths=cited
+        check="judgment",
+        value=criterion.value,
+        passed=passed,
+        detail=evidence,
+        cited_paths=cited_paths,
     )
 
 
-# ---------------------------------------------------------------------------
-# integration critic (runs once per run, over the full spec + full diff)
-# ---------------------------------------------------------------------------
-
-
-def run_integration_critic(
-    layout: RunLayout, cfg: Config, adapter: Adapter, *, state: State | None = None
-) -> IntegrationVerdict:
-    diff_text = resume_module.owns_diff(layout.repo, ["."])
-    task_body = cfg.phases["validate-integration"].body.replace(
-        "{diff}", diff_text or "(no diff: nothing changed in this run)"
-    )
-    result = _run_critic(layout, cfg, adapter, task_body, label="integration", state=state)
-    passed, evidence, cited = _parse_verdict(result)
-    return IntegrationVerdict(passed=passed, evidence=evidence, cited_paths=cited)
-
-
-def attribute_paths(all_tasks: list[Task], cited_paths: list[str]) -> list[str]:
-    """Which tasks' declared `owns` cover the integration critic's cited
-    paths. A cited path nobody's `owns` covers means the gap has no owning
-    task — that's a "missing work" case the driver must not silently retry
-    (see the module docstring's deferred-work note)."""
-    attributed: set[str] = set()
-    for path in cited_paths:
-        for task in all_tasks:
-            if any(worktree.covers(path, entry) for entry in task.owns):
-                attributed.add(task.id)
-    return sorted(attributed)
-
-
-# ---------------------------------------------------------------------------
-# shared critic plumbing
-# ---------------------------------------------------------------------------
-
-
-def _run_critic(
-    layout: RunLayout,
-    cfg: Config,
-    adapter: Adapter,
-    task_body: str,
-    *,
-    label: str,
-    state: State | None = None,
-) -> RunResult:
-    spec_text = layout.spec.read_text(encoding="utf-8") if layout.spec.exists() else ""
-    critic = cfg.experts.get("critic")
-    critic_body = _critic_body(critic.body if critic else "", adapter)
-    prompt = compose(cfg.base, critic_body, "", task_body, spec=spec_text)
-    allowed_tools = list(critic.tools) if critic and critic.tools else None
-    if state is None:
-        return adapter.run(prompt, cwd=layout.repo, allowed_tools=allowed_tools, tier="standard")
-    return run_with_activity(
-        adapter,
-        layout,
-        state,
-        label=label,
-        kind="validate",
-        prompt=prompt,
-        cwd=layout.repo,
-        allowed_tools=allowed_tools,
-        tier="standard",
-    )
-
-
-def _critic_body(body: str, adapter: Adapter) -> str:
-    if CODE_REVIEW_CAPABILITY in adapter.capabilities():
-        return f"{body}\n\n{CODE_REVIEW_INSTRUCTION}"
-    return body
-
-
-def _parse_verdict(result: RunResult) -> tuple[bool, str, list[str]]:
-    if result.exit_status != "ok" or result.structured is None:
-        return False, f"critic run failed: {result.text[:200]}", []
-    payload = result.structured
-    passed = payload.get("pass") is True
-    evidence = str(payload.get("evidence", "") or "")
-    cited = list(payload.get("cited_paths", []) or [])
-    if passed and not cited:
-        return False, f"AUTO-FAIL (pass=true with no cited_paths): {evidence}", []
-    return passed, evidence, cited
-
-
-# ---------------------------------------------------------------------------
-# feedback (ticket 005 Rule 4 resume read-set: appended to scratch, never a
-# transcript) + the always-written audit report
-# ---------------------------------------------------------------------------
-
-
-def _append_scratch(layout: RunLayout, task_id: str, text: str) -> None:
-    path = layout.scratch_dir / f"{task_id}.md"
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(text)
-
-
-def write_task_feedback(layout: RunLayout, tv: TaskValidation) -> None:
+def _write_feedback(layout: RunLayout, tv: TaskValidation) -> None:
     lines = [f"\n## Validation feedback ({tv.task.id})\n"]
     for r in tv.results:
         status = "PASS" if r.passed else "FAIL"
@@ -303,45 +140,27 @@ def write_task_feedback(layout: RunLayout, tv: TaskValidation) -> None:
         lines.append(f"  {r.detail.strip()}")
         if r.cited_paths:
             lines.append(f"  cited_paths: {r.cited_paths}")
-    _append_scratch(layout, tv.task.id, "\n".join(lines) + "\n")
+    append_scratch(layout, tv.task.id, "\n".join(lines) + "\n")
 
 
-def write_integration_feedback(
-    layout: RunLayout, task_id: str, integration: IntegrationVerdict
-) -> None:
-    lines = [
-        f"\n## Integration validation feedback ({task_id})\n",
-        f"- integration critic FAIL: {integration.evidence}",
-        f"  cited_paths: {integration.cited_paths}",
-    ]
-    _append_scratch(layout, task_id, "\n".join(lines) + "\n")
-
-
-def write_report(
-    layout: RunLayout,
-    task_validations: list[TaskValidation],
-    integration: IntegrationVerdict | None,
-) -> None:
-    lines = [f"# Validation report — {layout.run_id}", ""]
-    for tv in task_validations:
-        lines.append(f"## {tv.task.id} — {'PASS' if tv.passed else 'FAIL'}")
-        lines.append("")
-        for r in tv.results:
-            lines.append(f"- [{r.check}] {'PASS' if r.passed else 'FAIL'}: {r.value}")
-            lines.extend(f"  {line}" for line in r.detail.strip().splitlines())
-            if r.cited_paths:
-                lines.append(f"  cited_paths: {r.cited_paths}")
-        lines.append("")
-    lines.append("## Integration")
-    lines.append("")
-    if integration is None:
-        lines.append("not run — task-level exit criteria failed first")
-    else:
-        lines.append(f"status: {'PASS' if integration.passed else 'FAIL'}")
-        lines.append(f"evidence: {integration.evidence}")
-        lines.append(f"cited_paths: {integration.cited_paths}")
-    _report_path(layout).write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _report_path(layout: RunLayout) -> Path:
-    return layout.root / REPORT_FILENAME
+def evaluate_task(
+    layout: RunLayout, adapter: Adapter, task: Task, *, diff_text: str
+) -> TaskValidation:
+    """Leaf done iff every `cmd` criterion exits 0 AND the `judgment` verdict
+    passes structurally. On failure, append findings to the task's scratch
+    file — a resume read-set, not a transcript."""
+    spec_text = layout.spec.read_text(encoding="utf-8") if layout.spec.exists() else ""
+    results: list[CriterionResult] = []
+    for criterion in task.exit_criteria:
+        if criterion.check == "cmd":
+            results.append(_run_cmd_criterion(layout.repo, criterion))
+        else:
+            results.append(
+                _run_judgment_criterion(
+                    adapter, layout.repo, criterion, spec_text=spec_text, diff_text=diff_text
+                )
+            )
+    tv = TaskValidation(task=task, results=results)
+    if not tv.passed:
+        _write_feedback(layout, tv)
+    return tv

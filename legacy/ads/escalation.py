@@ -278,9 +278,7 @@ def reject(layout: RunLayout, state: State, request_id: str, reason: str) -> Esc
 
     request = _set_status(layout, request_id, STATUS_REJECTED)
     state.escalations[request_id] = STATUS_REJECTED
-    append_event(
-        layout, "escalation_reject", id=request_id, task_id=request.task_id, reason=reason
-    )
+    append_event(layout, "escalation_reject", id=request_id, task_id=request.task_id, reason=reason)
 
     task = _find_task(layout, request.task_id)
     if task is not None:

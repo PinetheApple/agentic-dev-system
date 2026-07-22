@@ -1,430 +1,242 @@
-"""Entrypoint: `driver start|approve|reject|status|resume`."""
+"""The 7 user-in-the-loop CLI verbs (ticket 006): `init`, `start`, `approve`,
+`reject`, `answer`, `status`, `resume`. Blocking-drain model — each verb that
+mutates the halt-state calls `drive()` in the foreground, streaming the live
+feed, until the loop halts again or reaches `done`.
+"""
 
 from __future__ import annotations
 
 import argparse
-import importlib.resources
-import shutil
-import sys
+import json
 import time
-from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import cast, get_args
+from typing import Any, cast
 
-from ads import control, escalation, sandbox, status, tui
-from ads._literal import validate_literal
-from ads.adapters.base import (
-    ADAPTER_CLAUDE_CODE,
-    ADAPTER_NAMES,
-    ADAPTER_OPENCODE,
-    ADAPTER_STUB,
-    Adapter,
-    AdapterName,
-)
-from ads.adapters.claude_code import ClaudeCodeAdapter
-from ads.adapters.opencode import OpenCodeAdapter
+from ads.adapters.base import Adapter, AdapterName
 from ads.adapters.stub import StubAdapter
-from ads.config import Config, load_config
-from ads.driver import approve as driver_approve
-from ads.driver import reject as driver_reject
-from ads.driver import run_until_halt, start_run
-from ads.layout import RunLayout
-from ads.state import load_state, save_state
+from ads.driver import ATTEMPTS_CEILING, PLAN_ATTEMPTS_KEY, drive
+from ads.feed import Feed
+from ads.layout import AGENT_DIR, RUNS_DIRNAME, RunLayout
+from ads.state import State, append_event, describe_halt, halt, load_state, save_state
 
 
-def _adapter_name_arg(raw: str | None) -> AdapterName | None:
-    """`argparse`'s `choices=` already restricts `--adapter` to valid names at
-    the shell boundary; this makes that runtime guarantee visible to the type
-    checker instead of trusting `argparse.Namespace`'s untyped attributes."""
-    if raw is None:
-        return None
-    return cast(AdapterName, validate_literal(raw, get_args(AdapterName), field="--adapter"))
+def _make_run_id() -> str:
+    return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
 
 
-def _build_adapter(name: AdapterName, cfg: Config) -> Adapter:
-    if name == ADAPTER_STUB:
-        return StubAdapter()
-    policy = sandbox.policy_from_harness(cfg.harness)
-    if name == ADAPTER_OPENCODE:
-        return OpenCodeAdapter(cfg.harness, policy=policy)
-    return ClaudeCodeAdapter(cfg.harness, policy=policy)
+def _link_current(layout: RunLayout) -> None:
+    link = layout.current_link
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(Path(layout.run_id))
 
 
-def _adapter_for_run(layout: RunLayout, cfg: Config, override: AdapterName | None) -> Adapter:
-    """Use the run's persisted adapter; an explicit --adapter override is
-    honored but persisted so it sticks and no mid-run mismatch can recur."""
-    state = load_state(layout)
-    name = override or state.adapter
-    if override and override != state.adapter:
-        print(f"warning: switching run adapter {state.adapter!r} -> {override!r}", file=sys.stderr)
-        state.adapter = override
-        save_state(layout, state)
-    return _build_adapter(name, cfg)
-
-
-def _require_adapter_name(raw: str | None) -> AdapterName:
-    name = _adapter_name_arg(raw)
-    if name is None:
-        raise SystemExit(f"unknown adapter: {raw!r}")
-    return name
-
-
-def _resolve_run_id(layout_root: RunLayout, explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    link = layout_root.current_link
+def _resolve_current(repo: Path) -> RunLayout:
+    link = repo / AGENT_DIR / RUNS_DIRNAME / "current"
     if not link.exists():
-        raise SystemExit(
-            "no run-id given and no .agent/runs/current — use --run-id or `driver start`"
-        )
-    return Path(link).resolve().name
-
-
-def _print_status(layout: RunLayout) -> None:
-    print(status.render_plain(status.read_status(layout)), end="")
-
-
-def _copy_template_tree(src: Traversable, dst: Path) -> None:
-    """Recursively copy a package-resource tree onto the filesystem — plain
-    `shutil.copytree` can't take an `importlib.resources.files()` handle
-    directly (it may be a real dir on a checkout or a zip-backed Traversable
-    on an installed wheel), so this walks it by hand."""
-    dst.mkdir(parents=True, exist_ok=True)
-    for entry in src.iterdir():
-        target = dst / entry.name
-        if entry.is_dir():
-            _copy_template_tree(entry, target)
-        else:
-            target.write_bytes(entry.read_bytes())
-
-
-def cmd_init(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    config_dir = repo / ".agent" / "config"
-    adapter_name = _adapter_name_arg(args.adapter) or ADAPTER_CLAUDE_CODE
-
-    if config_dir.exists() and any(config_dir.iterdir()) and not args.force:
-        raise SystemExit(
-            f"{config_dir} already exists and is non-empty — pass --force to overwrite"
-        )
-    if config_dir.exists() and args.force:
-        shutil.rmtree(config_dir)
-
-    template_root = importlib.resources.files("ads") / "templates" / "starter" / ".agent" / "config"
-    _copy_template_tree(template_root, config_dir)
-
-    if adapter_name == ADAPTER_OPENCODE:
-        # Lower-churn than maintaining a second mirrored template tree: the
-        # starter is claude-code-shaped (harness.toml is the only
-        # harness-aware file, see ads/config.py); point the user at
-        # examples/demo/.agent/config/harness.opencode-free.toml as the
-        # reference shape to hand-edit into their scaffolded harness.toml.
-        print(
-            "note: --adapter opencode scaffolded the claude-code starter config — "
-            "edit .agent/config/harness.toml's [tier_model]/[run]/[capabilities] "
-            "to target opencode (see examples/demo/.agent/config/harness.opencode-free.toml "
-            "for the reference shape); [sandbox] can stay disabled either way."
-        )
-
-    print(f"scaffolded {config_dir}")
-    print("next steps:")
-    print('  driver start "<your task>"')
-    print("  driver approve   # spec stage -> design stage")
-    print("  driver approve   # design stage -> dispatch, then auto-runs")
-    print("  driver watch     # live TUI (or: driver status --json)")
-
-
-def cmd_start(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    run_id = args.run_id or time.strftime("run-%Y%m%d-%H%M%S")
-    layout = RunLayout(repo=repo, run_id=run_id)
-    cfg = load_config(layout.config)
-    adapter_name = _adapter_name_arg(args.adapter) or ADAPTER_CLAUDE_CODE
-    adapter = _build_adapter(adapter_name, cfg)
-
-    start_run(layout, args.task)
-    state = load_state(layout)
-    state.adapter = adapter_name
-    # Ticket 010: best-effort marker that a foreground process currently
-    # holds this run; mainly feeds the read model today, a future sync-block
-    # would key off it too. Kept minimal — not cleared mid-loop, only here.
-    state.attached = True
-    save_state(layout, state)
-    run_until_halt(layout, cfg, adapter)
-    _print_status(layout)
-
-
-def cmd_resume(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    cfg = load_config(layout.config)
-    adapter = _build_adapter(_require_adapter_name(args.adapter), cfg)
-
-    # Ticket 010: `driver resume` is both the "resume" control verb (clears
-    # any operator pause) AND the foreground drive that drains it — the
-    # async substrate's own doc says "a foreground `driver resume` drains
-    # them", so this is the one command that enqueues its own resume signal
-    # and immediately drains it, rather than forcing two separate
-    # invocations under the same subcommand name.
-    control.enqueue(layout, control.ControlCommand(verb="resume"))
-    run_until_halt(layout, cfg, adapter)
-    _print_status(layout)
-
-
-def cmd_approve(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    driver_approve(layout)
-    if args.no_continue:
-        _print_status(layout)
-        return
-    cfg = load_config(layout.config)
-    adapter = _adapter_for_run(layout, cfg, _adapter_name_arg(args.adapter))
-    run_until_halt(layout, cfg, adapter)
-    _print_status(layout)
-
-
-def cmd_reject(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    driver_reject(layout, args.reason)
-    if args.no_continue:
-        _print_status(layout)
-        return
-    cfg = load_config(layout.config)
-    adapter = _adapter_for_run(layout, cfg, _adapter_name_arg(args.adapter))
-    run_until_halt(layout, cfg, adapter)
-    _print_status(layout)
-
-
-def cmd_status(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    run_status = status.read_status(layout)
-    if args.json:
-        print(status.to_json(run_status))
-    else:
-        print(status.render_plain(run_status), end="")
-
-
-def cmd_watch(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    try:
-        tui.run_tui(layout, poll_seconds=args.poll)
-    except tui.TUIUnavailable as exc:
-        print(f"watch needs an interactive terminal ({exc}); showing a snapshot instead:")
-        _print_status(layout)
-
-
-def cmd_escalations(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    state = load_state(layout)
-    open_ids = escalation.list_open(state)
-    if not open_ids:
-        print("no open escalations")
-        return
-    for request_id in open_ids:
-        request = escalation.load_request(layout, request_id)
-        reason = request.reason.splitlines()[0] if request.reason else ""
-        print(
-            f"{request.id}\ttask={request.task_id}\tkind={request.kind}\t"
-            f"op={request.op}\ttarget={request.target}\treason={reason}"
-        )
-
-
-def cmd_escalate_approve(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    state = load_state(layout)
-    escalation.approve(layout, state, args.request_id)
-    if args.no_continue:
-        _print_status(layout)
-        return
-    cfg = load_config(layout.config)
-    adapter = _adapter_for_run(layout, cfg, _adapter_name_arg(args.adapter))
-    run_until_halt(layout, cfg, adapter)
-    _print_status(layout)
-
-
-def cmd_escalate_reject(args: argparse.Namespace) -> None:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
-    layout = RunLayout(repo=repo, run_id=run_id)
-    state = load_state(layout)
-    escalation.reject(layout, state, args.request_id, args.reason)
-    if args.no_continue:
-        _print_status(layout)
-        return
-    cfg = load_config(layout.config)
-    adapter = _adapter_for_run(layout, cfg, _adapter_name_arg(args.adapter))
-    run_until_halt(layout, cfg, adapter)
-    _print_status(layout)
-
-
-def _resolve_layout(args: argparse.Namespace) -> RunLayout:
-    repo = Path(args.repo).resolve()
-    stub_layout = RunLayout(repo=repo, run_id="current")
-    run_id = _resolve_run_id(stub_layout, args.run_id)
+        raise SystemExit("no current run — run `driver init` first")
+    run_id = link.resolve().name
     return RunLayout(repo=repo, run_id=run_id)
 
 
-def _enqueue_and_report(layout: RunLayout, command: control.ControlCommand) -> None:
-    """Ticket 010: async substrate — these commands only append to
-    control.jsonl and print a confirmation + status snapshot. They never
-    drive the loop themselves; a foreground `driver resume` drains them at
-    the next unit boundary, which is the intended async model."""
-    control.enqueue(layout, command)
-    label = f" {command.task_id}" if command.task_id else ""
-    print(f"queued: {command.verb}{label}")
-    _print_status(layout)
+def _adapter_for(state: State) -> Adapter:
+    if state.adapter == "stub":
+        return StubAdapter()
+    raise NotImplementedError("the claude-code adapter is out of scope for ticket 008 (stub-only)")
 
 
-def cmd_pause(args: argparse.Namespace) -> None:
-    layout = _resolve_layout(args)
-    _enqueue_and_report(layout, control.ControlCommand(verb="pause"))
+def _feed_sink(feed: Feed) -> Any:
+    def sink(line: str) -> None:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            feed.emit_line(line)
+            return
+        feed.emit_event(event)
+
+    return sink
 
 
-def cmd_replan(args: argparse.Namespace) -> None:
-    layout = _resolve_layout(args)
-    _enqueue_and_report(layout, control.ControlCommand(verb="replan"))
+def _drain(layout: RunLayout) -> int:
+    state = load_state(layout)
+    adapter = _adapter_for(state)
+    feed = Feed()
+    try:
+        final_state = drive(layout, adapter, on_event=_feed_sink(feed))
+    finally:
+        feed.close()
+    _print_status(layout, final_state)
+    return 0
 
 
-def cmd_redirect(args: argparse.Namespace) -> None:
-    layout = _resolve_layout(args)
-    _enqueue_and_report(
-        layout, control.ControlCommand(verb="redirect", task_id=args.task, note=args.note)
+def _print_status(layout: RunLayout, state: State, *, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(state.to_dict(), indent=2, sort_keys=True))
+        return
+    halt_label = describe_halt(state) or "-"
+    print(f"run {layout.run_id}: phase={state.phase} halt={halt_label} tasks={state.tasks}")
+
+
+# ---------------------------------------------------------------------------
+# verbs
+# ---------------------------------------------------------------------------
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    repo = Path.cwd()
+    run_id = _make_run_id()
+    layout = RunLayout(repo=repo, run_id=run_id)
+    layout.scaffold()
+    state = State(adapter=cast(AdapterName, args.adapter))
+    save_state(layout, state)
+    _link_current(layout)
+    print(f"initialized run {run_id}")
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    layout = _resolve_current(Path.cwd())
+    layout.intent.write_text(args.task, encoding="utf-8")
+    return _drain(layout)
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    layout = _resolve_current(Path.cwd())
+    state = load_state(layout)
+    current = describe_halt(state)
+    if args.at is not None and args.at != current:
+        raise SystemExit(f"stale approve: current halt is {current!r}, not {args.at!r}")
+    if current is None:
+        raise SystemExit("nothing to approve")
+
+    if current == "awaiting_plan_approval":
+        state.phase = "execute"
+        state.cursor = None
+    elif current == "awaiting_spec_approval":
+        state.review_stage = "design"
+    elif current == "awaiting_design_approval":
+        state.phase = "execute"
+        state.cursor = None
+    elif current == "awaiting_clarification":
+        state.question = None
+    elif current == "awaiting_signoff":
+        state.phase = "done"
+    elif current == "blocked":
+        state.gate = None
+        state.halt_reason = None
+
+    if current == "awaiting_signoff":
+        append_event(layout, state, "done")
+    append_event(layout, state, "gate_close", data={"gate": current, "decision": "approve"})
+    save_state(layout, state)
+    return _drain(layout)
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    layout = _resolve_current(Path.cwd())
+    state = load_state(layout)
+    current = describe_halt(state)
+    if current is None:
+        raise SystemExit("nothing to reject")
+
+    if current in ("awaiting_plan_approval", "awaiting_spec_approval", "awaiting_design_approval"):
+        attempts = state.attempts.get(PLAN_ATTEMPTS_KEY, 0) + 1
+        state.attempts[PLAN_ATTEMPTS_KEY] = attempts
+        if attempts >= ATTEMPTS_CEILING:
+            final_state = halt(layout, state, f"plan rejected {attempts} times: {args.reason}")
+            _print_status(layout, final_state)
+            return 0
+        state.phase = "plan"
+        if current != "awaiting_design_approval":
+            state.review_stage = None
+        # else: review_stage stays "design" — freeze-approved-upstream, spec
+        # is not regenerated by a design-stage reject.
+    elif current == "awaiting_signoff":
+        # Ticket 006 doesn't pin an exact task-selection mechanic for a
+        # signoff-stage reject; bounce to a full replan as the safe default.
+        state.phase = "plan"
+        state.review_stage = None
+    else:
+        raise SystemExit(f"reject is not valid from halt-state {current!r}")
+
+    append_event(
+        layout,
+        state,
+        "gate_close",
+        data={"gate": current, "decision": "reject", "reason": args.reason},
     )
+    save_state(layout, state)
+    return _drain(layout)
 
 
-def cmd_edit(args: argparse.Namespace) -> None:
-    layout = _resolve_layout(args)
-    _enqueue_and_report(layout, control.ControlCommand(verb="edit", task_id=args.task))
+def cmd_answer(args: argparse.Namespace) -> int:
+    layout = _resolve_current(Path.cwd())
+    state = load_state(layout)
+    current = describe_halt(state)
+    if current != "awaiting_clarification":
+        msg = f"answer is only valid at awaiting_clarification, current halt is {current!r}"
+        raise SystemExit(msg)
+
+    with layout.intent.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n\n## Clarification\n\n{args.text}\n")
+    state.question = None
+    append_event(layout, state, "gate_close", data={"gate": current, "decision": "answer"})
+    save_state(layout, state)
+    return _drain(layout)
 
 
-def cmd_abort(args: argparse.Namespace) -> None:
-    layout = _resolve_layout(args)
-    _enqueue_and_report(layout, control.ControlCommand(verb="abort", task_id=args.task))
+def cmd_status(args: argparse.Namespace) -> int:
+    layout = _resolve_current(Path.cwd())
+    state = load_state(layout)
+    _print_status(layout, state, as_json=args.json)
+    return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+def cmd_resume(_args: argparse.Namespace) -> int:
+    layout = _resolve_current(Path.cwd())
+    return _drain(layout)
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="driver")
-    parser.add_argument("--repo", default=".", help="repo root (default: cwd)")
-    parser.add_argument("--run-id", default=None, help="run id (default: .agent/runs/current)")
-    parser.add_argument(
-        "--adapter",
-        default=None,
-        choices=ADAPTER_NAMES,
-        help="harness adapter; set at start, persisted per-run",
-    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="scaffold .agent/config/ into --repo")
-    p_init.add_argument(
-        "--force", action="store_true", help="overwrite an existing non-empty .agent/config/"
-    )
+    p_init = sub.add_parser("init")
+    p_init.add_argument("--adapter", default="stub", choices=["stub", "claude-code"])
     p_init.set_defaults(func=cmd_init)
 
-    p_start = sub.add_parser("start", help="start a new run")
-    p_start.add_argument("task", help="the user's task/intent text")
+    p_start = sub.add_parser("start")
+    p_start.add_argument("task")
     p_start.set_defaults(func=cmd_start)
 
-    p_resume = sub.add_parser("resume", help="resume the current (or given) run")
-    p_resume.set_defaults(func=cmd_resume)
-
-    p_approve = sub.add_parser("approve", help="approve the current review gate")
-    p_approve.add_argument(
-        "--no-continue", action="store_true", help="don't auto-advance after approving"
-    )
+    p_approve = sub.add_parser("approve")
+    p_approve.add_argument("--at", default=None)
     p_approve.set_defaults(func=cmd_approve)
 
-    p_reject = sub.add_parser("reject", help="reject the current review gate")
-    p_reject.add_argument("reason", help="why it was rejected")
-    p_reject.add_argument(
-        "--no-continue", action="store_true", help="don't auto-advance after rejecting"
-    )
+    p_reject = sub.add_parser("reject")
+    p_reject.add_argument("reason")
     p_reject.set_defaults(func=cmd_reject)
 
-    p_status = sub.add_parser("status", help="show run state")
-    p_status.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    p_answer = sub.add_parser("answer")
+    p_answer.add_argument("text")
+    p_answer.set_defaults(func=cmd_answer)
+
+    p_status = sub.add_parser("status")
+    p_status.add_argument("--json", action="store_true")
     p_status.set_defaults(func=cmd_status)
 
-    p_watch = sub.add_parser("watch", help="live TUI dashboard over run status")
-    p_watch.add_argument(
-        "--poll", type=float, default=1.0, help="poll interval in seconds (default: 1.0)"
-    )
-    p_watch.set_defaults(func=cmd_watch)
-
-    p_escalations = sub.add_parser("escalations", help="list open escalation requests")
-    p_escalations.set_defaults(func=cmd_escalations)
-
-    p_esc_approve = sub.add_parser("escalate-approve", help="approve an escalation request")
-    p_esc_approve.add_argument("request_id", help="escalation request id (e.g. esc-01-a-1)")
-    p_esc_approve.add_argument(
-        "--no-continue", action="store_true", help="don't auto-advance after approving"
-    )
-    p_esc_approve.set_defaults(func=cmd_escalate_approve)
-
-    p_esc_reject = sub.add_parser("escalate-reject", help="reject an escalation request")
-    p_esc_reject.add_argument("request_id", help="escalation request id (e.g. esc-01-a-1)")
-    p_esc_reject.add_argument("reason", help="why it was rejected")
-    p_esc_reject.add_argument(
-        "--no-continue", action="store_true", help="don't auto-advance after rejecting"
-    )
-    p_esc_reject.set_defaults(func=cmd_escalate_reject)
-
-    p_pause = sub.add_parser("pause", help="queue an operator pause (drained at next boundary)")
-    p_pause.set_defaults(func=cmd_pause)
-
-    p_replan = sub.add_parser("replan", help="queue a full replan loopback to the plan phase")
-    p_replan.set_defaults(func=cmd_replan)
-
-    p_redirect = sub.add_parser("redirect", help="queue a note injected into a task's scratch file")
-    p_redirect.add_argument("task", help="task id to redirect")
-    p_redirect.add_argument("note", help="operator note to inject")
-    p_redirect.set_defaults(func=cmd_redirect)
-
-    p_edit = sub.add_parser(
-        "edit", help="queue a pause so a pending task's file can be hand-edited"
-    )
-    p_edit.add_argument("task", help="task id to edit")
-    p_edit.set_defaults(func=cmd_edit)
-
-    p_abort = sub.add_parser("abort", help="queue an abort for a task (graph bookkeeping only)")
-    p_abort.add_argument("task", help="task id to abort")
-    p_abort.set_defaults(func=cmd_abort)
+    p_resume = sub.add_parser("resume")
+    p_resume.set_defaults(func=cmd_resume)
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    parser = _build_parser()
     args = parser.parse_args(argv)
-    try:
-        args.func(args)
-    except SystemExit:
-        raise
-    except Exception as exc:  # top-level CLI boundary: fail loud, no traceback spam
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    return 0
+    return cast(int, args.func(args))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
