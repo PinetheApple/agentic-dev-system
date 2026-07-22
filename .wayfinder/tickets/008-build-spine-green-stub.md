@@ -52,5 +52,5 @@ append-only gap-free `events.jsonl`, stale/matching `--at`, table-driven `_owns_
 (incl. the `src/tui` vs `src/tui-old` false-positive trap) + `check_acyclic` + `ready_batch`,
 and all four anti-forgery/plan-gate cases.
 
-SHA: pending — working tree left uncommitted for user review (no commit without ask).
+SHA: `a24d733` on `origin/minimal-core` (PR: github.com/PinetheApple/agentic-dev-system/pull/new/minimal-core).
 Next: **#009** swaps stub → claude-code adapter and drives the maiden self-hosted task.

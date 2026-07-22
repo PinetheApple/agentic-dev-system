@@ -1,7 +1,7 @@
 <!-- labels: wayfinder:task -->
 # Prove the spine end-to-end on Claude Code — first self-hosted task: the curses TUI
 
-Assignee: _(unassigned)_
+Assignee: PinetheApple (Claude Code session)
 Blocked by: #008
 
 ## Question

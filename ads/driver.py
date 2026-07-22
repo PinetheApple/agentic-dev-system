@@ -18,8 +18,10 @@ from typing import cast
 
 from ads._literal import validate_literal
 from ads.adapters.base import Adapter
+from ads.config import load_base, load_optional, render_phase
 from ads.layout import RunLayout
 from ads.phase_json import PlanPayload, TaskPayload, parse_execute_handoff, parse_plan_payload
+from ads.prompt import compose
 from ads.state import State, append_event, describe_halt, halt, load_state, save_state
 from ads.task_io import load_tasks, write_task
 from ads.tasks import (
@@ -95,7 +97,8 @@ def _advance_plan(
     # spec is already user-approved and must not be regenerated.
     design_frozen = state.review_stage == "design"
     intent_text = layout.intent.read_text(encoding="utf-8")
-    prompt = f"PHASE:plan\n\n## Intent\n\n{intent_text}\n"
+    task_body = render_phase(layout.config, "plan", {"intent": intent_text})
+    prompt = compose(base=load_base(layout.config), expert_body="", design="", task_body=task_body)
     result = adapter.run(prompt, layout.repo, role="planning", on_event=on_event)
     payload: PlanPayload = parse_plan_payload(result.text)
 
@@ -167,7 +170,18 @@ def _run_task(
     append_event(layout, state, "task:start", task=task.id)
     save_state(layout, state)
 
-    prompt = f"PHASE:execute\nTASK_ID: {task.id}\n\n## Task\n\n{task.body}\n"
+    task_body = render_phase(
+        layout.config,
+        "execute",
+        {"task_id": task.id, "owns": ", ".join(task.owns), "task": task.body},
+    )
+    prompt = compose(
+        base=load_base(layout.config),
+        expert_body="",
+        design=load_optional(layout.design),
+        task_body=task_body,
+        spec=load_optional(layout.spec),
+    )
     result = adapter.run(prompt, layout.repo, role="execution", on_event=on_event)
     handoff = parse_execute_handoff(result.text)
     blocking = [issue["desc"] for issue in handoff["issues"] if issue.get("blocking")]

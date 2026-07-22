@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ads.adapters.base import Adapter, AdapterName
+from ads.adapters.claude import ClaudeCodeAdapter
 from ads.adapters.stub import StubAdapter
 from ads.driver import ATTEMPTS_CEILING, PLAN_ATTEMPTS_KEY, drive
 from ads.feed import Feed
@@ -43,7 +44,7 @@ def _resolve_current(repo: Path) -> RunLayout:
 def _adapter_for(state: State) -> Adapter:
     if state.adapter == "stub":
         return StubAdapter()
-    raise NotImplementedError("the claude-code adapter is out of scope for ticket 008 (stub-only)")
+    return ClaudeCodeAdapter()
 
 
 def _feed_sink(feed: Feed) -> Any:

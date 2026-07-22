@@ -10,8 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ads.adapters.base import Adapter
+from ads.config import load_base, render_phase
 from ads.layout import RunLayout
 from ads.phase_json import parse_judgment_verdict
+from ads.prompt import compose
 from ads.task_io import append_scratch
 from ads.tasks import ExitCriterion, ExitCriterionCheck, Task, TaskParseError
 
@@ -89,24 +91,27 @@ def _run_cmd_criterion(cwd: Path, criterion: ExitCriterion) -> CriterionResult:
     )
 
 
-def _judgment_prompt(spec_text: str, diff_text: str, assertion: str) -> str:
-    return (
-        "## Spec\n\n"
-        f"{spec_text.strip()}\n\n"
-        "## Owns-diff\n\n"
-        f"{diff_text.strip()}\n\n"
-        "## Assertion to verify\n\n"
-        f"{assertion}\n\n"
-        "Respond with a bare JSON object: "
-        '{"pass": bool, "evidence": str, "cited_paths": [str, ...]}. '
-        "`cited_paths` must be paths that literally appear in the owns-diff above."
+def _judgment_prompt(layout: RunLayout, spec_text: str, diff_text: str, assertion: str) -> str:
+    task_body = render_phase(layout.config, "validate", {"criterion": assertion, "diff": diff_text})
+    return compose(
+        base=load_base(layout.config),
+        expert_body="",
+        design="",
+        task_body=task_body,
+        spec=spec_text,
     )
 
 
 def _run_judgment_criterion(
-    adapter: Adapter, cwd: Path, criterion: ExitCriterion, *, spec_text: str, diff_text: str
+    layout: RunLayout,
+    adapter: Adapter,
+    cwd: Path,
+    criterion: ExitCriterion,
+    *,
+    spec_text: str,
+    diff_text: str,
 ) -> CriterionResult:
-    prompt = _judgment_prompt(spec_text, diff_text, criterion.value)
+    prompt = _judgment_prompt(layout, spec_text, diff_text, criterion.value)
     result = adapter.run(prompt, cwd, role="validation")
     verdict = parse_judgment_verdict(result.text)
     passed = verdict["pass"]
@@ -157,7 +162,12 @@ def evaluate_task(
         else:
             results.append(
                 _run_judgment_criterion(
-                    adapter, layout.repo, criterion, spec_text=spec_text, diff_text=diff_text
+                    layout,
+                    adapter,
+                    layout.repo,
+                    criterion,
+                    spec_text=spec_text,
+                    diff_text=diff_text,
                 )
             )
     tv = TaskValidation(task=task, results=results)

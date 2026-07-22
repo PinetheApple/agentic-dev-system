@@ -1,0 +1,9 @@
+# Only harness-aware file in the config tree. Target: claude-code.
+
+[tier_model]
+fast = "claude-haiku-4-5"
+standard = "claude-sonnet-5"
+deep = "claude-opus-4-8"
+
+[run]
+cmd = ["claude", "-p"]
